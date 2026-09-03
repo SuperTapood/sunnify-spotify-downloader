@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **official YouTube audio hidden behind a surfaced title typo is now found without weakening the wrong-song guard.** YouTube's normal search returns only three results for `בנים כמוני לא בוכים`, omitting the exact-title Topic audio and exposing an official video whose own title says `כמו` instead of `כמוני`. A targeted Topic retry now recovers the exact audio and accepts channel/uploader artist attribution (`DuduFaruk` vs `Dudu Faruk`); if that catalog result is unavailable, the typoed video remains rejected by strict title matching.
+- **localized and hard-to-surface catalog tracks no longer stall playlist resumes.** Matching now preserves Japanese voicing marks, recognizes explicit bilingual aliases (`エマニエル - Emmanuelle`) and aliases embedded in native-script metadata (`Alice`), treats punctuation-only short titles such as `S&M` as token sequences, and tries narrow quoted edition, soundtrack-album, auto-generated-audio, and verified artist-title searches. Opposite-script spellings such as `Docchi`/`どっち`, `紙様`/`Kamisama`, and `Tarinaifutari`/`たりないふたり` are accepted only for a tightly duration-matched structured art track with matching artist evidence plus either the exact album or a spelling learned from the verified artist channel. The same gates recover the exact `Herald of Darkness (Video Edit)`, `in the pool`, `MARGHERITA + AiNA THE END`, `Joendanyusho`, and `His Dream` sources while rejecting the karaoke release, piano cover, long music-video cut, and same-length `This Dream` neighbor.
+- **per-track album enrichment now reaches the YouTube matcher and final tags.** Compact Spotify playlist rows often omit their album even though the individual track endpoint supplies it; keeping that value makes album-bound catalog recovery reliable and prevents a licensed tribute or arranged release from impersonating the requested recording.
+- **real hyphenated titles and token boundaries are no longer mistaken for variants or substrings.** Only recognized release suffixes such as `Live`, `Video Edit`, and `Remastered 2011` are stripped, so `Emil - Despair` and `Dark Colossus - Kaiju` remain intact; `His Dream` can no longer match `This Dream`.
+
 ## [2.4.1] - 2026-08-31
 
 ### Fixed

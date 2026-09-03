@@ -6,6 +6,7 @@ import contextlib
 import os
 import sys
 import threading
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -368,13 +369,18 @@ class TestYoutubeMatchSelection:
 
         return MusicScraper()
 
-    def _patched(self, entries):
-        candidates = {"entries": entries}
+    def _patched(self, entries, *additional_results):
         ctx = patch("Spotify_Downloader.YoutubeDL")
         mock_ydl = ctx.start()
         mock_ydl.return_value.__enter__ = MagicMock(return_value=mock_ydl)
         mock_ydl.return_value.__exit__ = MagicMock(return_value=False)
-        mock_ydl.extract_info = MagicMock(return_value=candidates)
+        results = (entries, *additional_results)
+        if additional_results:
+            mock_ydl.extract_info = MagicMock(
+                side_effect=[{"entries": result} for result in results]
+            )
+        else:
+            mock_ydl.extract_info = MagicMock(return_value={"entries": entries})
         return ctx
 
     def test_picks_duration_closest_not_top_hit(self):
@@ -608,6 +614,70 @@ class TestYoutubeMatchSelection:
         assert MusicScraper._normalize_title("MONTAGEM BAILÃO") == "montagem bailao"
         assert MusicScraper._normalize_title("Beyoncé") == "beyonce"
 
+    def test_normalize_preserves_japanese_voicing_and_cyrillic_breve(self):
+        """NFKD must not erase marks that change letters in these scripts."""
+        from Spotify_Downloader import MusicScraper
+
+        assert MusicScraper._normalize_title("どっち") == "どっち"
+        assert MusicScraper._normalize_title("ビリケン") == "ビリケン"
+        assert MusicScraper._normalize_title("ヴォイス") == "ヴォイス"
+        assert MusicScraper._normalize_title("かみ") != MusicScraper._normalize_title("がみ")
+        assert MusicScraper._normalize_title("й") != MusicScraper._normalize_title("и")
+        assert MusicScraper._normalize_title("мо́ре") == MusicScraper._normalize_title("море")
+
+    def test_short_multi_token_title_uses_a_token_sequence(self):
+        """`S&M` normalizes to two short tokens; it is not one `s m` token."""
+        from Spotify_Downloader import MusicScraper
+
+        assert MusicScraper._title_plausibly_matches("Rihanna - S & M (Audio)", "S&M")
+        assert MusicScraper._title_plausibly_matches("S&M", "S&M")
+        assert not MusicScraper._title_plausibly_matches("Sam Smith - Stay With Me", "S&M")
+        assert not MusicScraper._title_plausibly_matches("ASM compilation", "S&M")
+
+    def test_title_matching_uses_word_boundaries_for_long_phrases(self):
+        """Regression: `His Dream` is not a substring alias of `This Dream`."""
+        from Spotify_Downloader import MusicScraper
+
+        assert not MusicScraper._title_plausibly_matches("This Dream", "His Dream")
+
+    def test_only_recognized_release_suffixes_are_stripped(self):
+        """Real hyphenated titles survive; known Spotify variants do not."""
+        from Spotify_Downloader import MusicScraper
+
+        assert MusicScraper._spotify_title_core("Emil - Despair") == "Emil - Despair"
+        assert (
+            MusicScraper._spotify_title_core("Dark Colossus - Kaiju")
+            == "Dark Colossus - Kaiju"
+        )
+        assert MusicScraper._spotify_title_core("Hello - Live") == "Hello"
+        assert (
+            MusicScraper._spotify_title_core("Bohemian Rhapsody - Remastered 2011")
+            == "Bohemian Rhapsody"
+        )
+        assert MusicScraper._spotify_title_core("Song - 2011 Remaster") == "Song"
+        assert MusicScraper._spotify_title_core("Song - Extended Mix") == "Song"
+        assert MusicScraper._spotify_title_core("Song - Acoustic") == "Song"
+        assert MusicScraper._spotify_title_core("Song - Mono") == "Song"
+        assert MusicScraper._spotify_title_core("Song - From Example Film") == "Song"
+        assert MusicScraper._spotify_title_core("Song - Live - 2011 Remaster") == "Song"
+
+    def test_explicit_cross_script_spotify_aliases_are_retained(self):
+        """Spotify-provided aliases survive core/parenthetical normalization."""
+        from Spotify_Downloader import MusicScraper
+
+        assert MusicScraper._title_plausibly_matches(
+            "Creepy Nuts -Emmanuelle 【Visualizer】", "エマニエル - Emmanuelle"
+        )
+        assert MusicScraper._title_plausibly_matches(
+            "Alice", "愛麗絲（正式表記はAliceの中国語簡体字表記となります。）"
+        )
+        assert not MusicScraper._title_plausibly_matches("Live at Wembley", "Hello - Live")
+        assert not MusicScraper._title_plausibly_matches(
+            "Original Soundtrack", "曲 - Original Soundtrack"
+        )
+        assert not MusicScraper._title_plausibly_matches("2024 Remastered", "曲 (2024 Remastered)")
+        assert not MusicScraper._title_plausibly_matches("English Version", "曲 (English Version)")
+
     def test_normalize_preserves_non_latin_scripts(self):
         """The old [^a-z0-9] class erased Cyrillic/CJK/Greek titles to "" so
         no candidate could ever match (#77). Normalization must keep word
@@ -685,6 +755,817 @@ class TestYoutubeMatchSelection:
         finally:
             ctx.stop()
         assert url == "https://www.youtube.com/watch?v=kino"
+
+    def test_topic_retry_query_targets_the_primary_artist(self):
+        """Pin the live-reproduced query that exposes the otherwise hidden
+        Topic audio; the result sequence alone would not catch a bad query."""
+        from Spotify_Downloader import MusicScraper
+
+        assert MusicScraper._topic_search_query(
+            "בנים כמוני לא בוכים", "Dudu Faruk, Noa Kirel"
+        ) == "ytsearch5:בנים כמוני לא בוכים Dudu Faruk Topic"
+        assert MusicScraper._topic_search_query("S&M", "Sabl3") == (
+            "ytsearch5:S & M Sabl3 Topic"
+        )
+
+    def test_s_and_m_prefers_real_artist_credit_over_logged_audio_mix(self):
+        """Regression for the exact false positive reproduced in the GUI log."""
+        entries = [
+            {
+                "id": "fan-mix",
+                "duration": 244,
+                "title": "S&M || RIHANNA × SABL3 AUDIO MIX",
+                "channel": "ThatWasWeird",
+            },
+            {
+                "id": "sabl3-cover",
+                "duration": 229,
+                "title": "Rihanna - S&M (METAL COVER BY SABL3) [Spotify in description]",
+                "channel": "Sable",
+            },
+        ]
+        ctx = self._patched(entries)
+        try:
+            url = self._scraper()._select_youtube_match(
+                "ytsearch5:S&M Sabl3 audio",
+                228.281,
+                expected_title="S&M",
+                expected_artists="Sabl3",
+            )
+        finally:
+            ctx.stop()
+        assert url == "https://www.youtube.com/watch?v=sabl3-cover"
+
+    def test_s_and_m_audio_mix_rejection_retries_spaced_topic_query(self):
+        """When only the fan mix surfaces, retry the actual Topic spelling."""
+        initial_entries = [
+            {
+                "id": "fan-mix",
+                "duration": 244,
+                "title": "S&M || RIHANNA × SABL3 AUDIO MIX",
+                "channel": "ThatWasWeird",
+            }
+        ]
+        topic_entries = [
+            {
+                "id": "0Xu0okvBQoM",
+                "duration": 229,
+                "title": "S & M",
+                "channel": "Sabl3 - Topic",
+                "uploader": "Sabl3 - Topic",
+            }
+        ]
+        ctx = self._patched(initial_entries, topic_entries)
+        try:
+            scraper = self._scraper()
+            url = scraper._select_youtube_match(
+                "ytsearch5:S&M Sabl3 audio",
+                228.281,
+                expected_title="S&M",
+                expected_artists="Sabl3",
+            )
+            from Spotify_Downloader import YoutubeDL
+
+            assert YoutubeDL.extract_info.call_args_list[1].args[0] == (
+                "ytsearch5:S & M Sabl3 Topic"
+            )
+        finally:
+            ctx.stop()
+        assert url == "https://www.youtube.com/watch?v=0Xu0okvBQoM"
+
+    def test_exact_hebrew_topic_retry_uses_channel_for_artist(self):
+        """The ordinary search omits the linked Topic audio. A targeted retry
+        finds it, and its channel satisfies the artist gate despite Spotify's
+        spaced `Dudu Faruk` versus YouTube's `DuduFaruk`."""
+        initial_entries = [
+            {
+                "id": "4glr9j_yVUg",
+                "duration": 183,
+                "title": "דודו פארוק ונועה קירל - בנים כמו לא בוכים (Prod by benno)",
+                "channel": "DuduFaruk",
+            }
+        ]
+        topic_entries = [
+            {
+                "id": "cWJBKmQKRyY",
+                "duration": 182,
+                "title": "בנים כמוני לא בוכים",
+                "channel": "DuduFaruk",
+                "uploader": "DuduFaruk",
+            }
+        ]
+        ctx = self._patched(initial_entries, topic_entries)
+        try:
+            url = self._scraper()._select_youtube_match(
+                "ytsearch5:בנים כמוני לא בוכים Dudu Faruk Noa Kirel audio",
+                182,
+                expected_title="בנים כמוני לא בוכים",
+                expected_artists="Dudu Faruk, Noa Kirel",
+            )
+        finally:
+            ctx.stop()
+        assert url == "https://www.youtube.com/watch?v=cWJBKmQKRyY"
+
+    def test_topic_retry_recovers_after_empty_initial_search(self):
+        """An empty broad query is not final when the targeted Topic catalog
+        can still expose a fully validated exact-title result."""
+        topic_entries = [
+            {
+                "id": "cWJBKmQKRyY",
+                "duration": 182,
+                "title": "בנים כמוני לא בוכים",
+                "channel": "DuduFaruk",
+            }
+        ]
+        ctx = self._patched([], topic_entries)
+        try:
+            url = self._scraper()._select_youtube_match(
+                "ytsearch5:בנים כמוני לא בוכים Dudu Faruk audio",
+                182,
+                expected_title="בנים כמוני לא בוכים",
+                expected_artists="Dudu Faruk",
+            )
+        finally:
+            ctx.stop()
+        assert url == "https://www.youtube.com/watch?v=cWJBKmQKRyY"
+
+    @pytest.mark.parametrize(
+        "initial_entry",
+        [
+            {
+                "id": "wrong-artist",
+                "duration": 182,
+                "title": "בנים כמוני לא בוכים",
+                "channel": "Cover Channel",
+            },
+            {
+                "id": "wrong-duration",
+                "duration": 500,
+                "title": "בנים כמוני לא בוכים",
+                "channel": "DuduFaruk",
+            },
+        ],
+    )
+    def test_topic_retry_runs_after_any_complete_gate_failure(self, initial_entry):
+        """An exact title alone is insufficient: retry Topic when the broad
+        result fails either artist attribution or the duration guard."""
+        topic_entries = [
+            {
+                "id": "cWJBKmQKRyY",
+                "duration": 182,
+                "title": "בנים כמוני לא בוכים",
+                "channel": "DuduFaruk",
+            }
+        ]
+        ctx = self._patched([initial_entry], topic_entries)
+        try:
+            url = self._scraper()._select_youtube_match(
+                "ytsearch5:בנים כמוני לא בוכים Dudu Faruk audio",
+                182,
+                expected_title="בנים כמוני לא בוכים",
+                expected_artists="Dudu Faruk",
+            )
+        finally:
+            ctx.stop()
+        assert url == "https://www.youtube.com/watch?v=cWJBKmQKRyY"
+
+    def test_artist_attribution_uses_boundaries_for_short_names(self):
+        """New channel matching must not turn `Air` into a substring match
+        for an unrelated `Fair Use Music` channel."""
+        from Spotify_Downloader import MusicScraper
+
+        assert not MusicScraper._candidate_matches_any_artist(
+            {"title": "Song", "channel": "Fair Use Music"}, ["air"]
+        )
+        assert MusicScraper._candidate_matches_any_artist(
+            {"title": "Song", "channel": "Air - Topic"}, ["air"]
+        )
+
+    def test_typoed_official_video_stays_rejected_without_topic_audio(self):
+        """If the exact Topic retry stops surfacing the canonical audio, keep
+        the strict wrong-song guard: channel and duration cannot excuse the
+        official video's `כמוני` -> `כמו` title discrepancy."""
+        entries = [
+            {
+                "id": "4glr9j_yVUg",
+                "duration": 183,
+                "title": "דודו פארוק ונועה קירל - בנים כמו לא בוכים (Prod by benno)",
+                "channel": "DuduFaruk",
+                "uploader": "DuduFaruk",
+            },
+        ]
+        ctx = self._patched(entries)
+        try:
+            url = self._scraper()._select_youtube_match(
+                "ytsearch5:בנים כמוני לא בוכים Dudu Faruk Noa Kirel audio",
+                182,
+                expected_title="בנים כמוני לא בוכים",
+                expected_artists="Dudu Faruk, Noa Kirel",
+            )
+        finally:
+            ctx.stop()
+        assert url is None
+
+    def test_hydrated_topic_tags_recover_translated_catalog_title(self):
+        """Flat Topic titles can be Japanese while full tags carry Spotify's
+        exact English catalog title."""
+        topic_entry = {
+            "id": "wdOdu-5lV-M",
+            "duration": 329,
+            "title": "砂塵ノ記憶",
+            "channel": "Kuniyuki Takahashi - Topic",
+        }
+        hydrated = {
+            **topic_entry,
+            "uploader": "Kuniyuki Takahashi - Topic",
+            "track": "砂塵ノ記憶",
+            "album": "NieR:Automata Original Soundtrack",
+            "description": "Provided to YouTube by Sony Music\n\nAuto-generated by YouTube.",
+            "tags": [
+                "Kuniyuki Takahashi",
+                "高橋 邦幸",
+                "NieR:Automata Original Soundtrack",
+                "Memories of Dust",
+            ],
+            "artist": "Kuniyuki Takahashi",
+        }
+        with patch("Spotify_Downloader.YoutubeDL") as mock_ydl:
+            mock_ydl.return_value.__enter__ = MagicMock(return_value=mock_ydl)
+            mock_ydl.return_value.__exit__ = MagicMock(return_value=False)
+            mock_ydl.extract_info.side_effect = [
+                {"entries": []},
+                {"entries": [topic_entry]},
+                hydrated,
+            ]
+            url = self._scraper()._select_youtube_match(
+                "ytsearch5:Memories of Dust 高橋 邦幸 audio",
+                329.066,
+                expected_title="Memories of Dust",
+                expected_artists="高橋 邦幸",
+            )
+        assert url == "https://www.youtube.com/watch?v=wdOdu-5lV-M"
+
+    def test_verified_artist_does_not_guess_cross_script_title(self):
+        """Artist, rank, and duration cannot prove Docchi means どっち."""
+        topic_entry = {
+            "id": "zJDUFIVRsJw",
+            "duration": 298,
+            "title": "どっち",
+            "channel": "Creepy Nuts",
+        }
+        hydrated = {
+            **topic_entry,
+            "uploader": "Creepy Nuts",
+            "track": "どっち",
+            "artist": "Creepy Nuts",
+            "artists": ["Creepy Nuts"],
+            "channel_is_verified": True,
+            "tags": ["Creepy Nuts", "クリーピーナッツ", "どっち"],
+        }
+        with patch("Spotify_Downloader.YoutubeDL") as mock_ydl:
+            mock_ydl.return_value.__enter__ = MagicMock(return_value=mock_ydl)
+            mock_ydl.return_value.__exit__ = MagicMock(return_value=False)
+            mock_ydl.extract_info.side_effect = [
+                {"entries": []},
+                {"entries": [topic_entry]},
+                hydrated,
+            ]
+            url = self._scraper()._select_youtube_match(
+                "ytsearch5:Docchi Creepy Nuts audio",
+                297.373,
+                expected_title="Docchi",
+                expected_artists="Creepy Nuts",
+            )
+        assert url is None
+
+    @pytest.mark.parametrize(
+        ("expected_title", "expected_artists", "candidate_title", "tags"),
+        [
+            ("Mi Gente", "DJ Goja", "Mi Chico", ["DJ Goja", "Mi Chico"]),
+            (
+                "His Dream",
+                "SQUARE ENIX MUSIC",
+                "此ノ夢",
+                ["MONACA", "NieR Gestalt & NieR Replicant Original Soundtrack", "This Dream"],
+            ),
+        ],
+    )
+    def test_catalog_recovery_rejects_wrong_near_duration_song(
+        self, expected_title, expected_artists, candidate_title, tags
+    ):
+        """Hydration must expose, not excuse, a same-duration wrong song."""
+        topic_entry = {
+            "id": "wrong",
+            "duration": 117,
+            "title": candidate_title,
+            "channel": "DJ Goja - Topic"
+            if expected_title == "Mi Gente"
+            else "MONACA - Topic",
+        }
+        hydrated = {
+            **topic_entry,
+            "uploader": topic_entry["channel"],
+            "track": candidate_title,
+            "artist": "DJ Goja" if expected_title == "Mi Gente" else "MONACA",
+            "tags": tags,
+        }
+        with patch("Spotify_Downloader.YoutubeDL") as mock_ydl:
+            mock_ydl.return_value.__enter__ = MagicMock(return_value=mock_ydl)
+            mock_ydl.return_value.__exit__ = MagicMock(return_value=False)
+            mock_ydl.extract_info.side_effect = [
+                {"entries": []},
+                {"entries": [topic_entry]},
+                hydrated,
+            ]
+            url = self._scraper()._select_youtube_match(
+                f"ytsearch5:{expected_title} {expected_artists} audio",
+                117,
+                expected_title=expected_title,
+                expected_artists=expected_artists,
+            )
+        assert url is None
+
+    def test_catalog_recovery_rejects_unofficial_cross_script_cover(self):
+        """Artist words and matching duration do not make a user upload official."""
+        topic_entry = {
+            "id": "cover",
+            "duration": 200,
+            "title": "どっち Creepy Nuts cover",
+            "channel": "Fan Uploads",
+        }
+        hydrated = {
+            **topic_entry,
+            "uploader": "Fan Uploads",
+            "track": "どっち cover",
+            "artist": "Creepy Nuts",
+            "tags": ["Creepy Nuts"],
+            "channel_is_verified": False,
+        }
+        with patch("Spotify_Downloader.YoutubeDL") as mock_ydl:
+            mock_ydl.return_value.__enter__ = MagicMock(return_value=mock_ydl)
+            mock_ydl.return_value.__exit__ = MagicMock(return_value=False)
+            mock_ydl.extract_info.side_effect = [
+                {"entries": []},
+                {"entries": [topic_entry]},
+                hydrated,
+            ]
+            url = self._scraper()._select_youtube_match(
+                "ytsearch5:Docchi Creepy Nuts audio",
+                200,
+                expected_title="Docchi",
+                expected_artists="Creepy Nuts",
+            )
+        assert url is None
+
+    def test_catalog_metadata_does_not_override_a_wrong_artist(self):
+        """Even an exact common title on a real Topic item needs artist evidence."""
+        topic_entry = {
+            "id": "wrong-home",
+            "duration": 200,
+            "title": "Home",
+            "channel": "Wrong Artist - Topic",
+        }
+        hydrated = {
+            **topic_entry,
+            "uploader": "Wrong Artist - Topic",
+            "track": "Home",
+            "artist": "Wrong Artist",
+            "tags": ["Wrong Artist", "Home"],
+        }
+        with patch("Spotify_Downloader.YoutubeDL") as mock_ydl:
+            mock_ydl.return_value.__enter__ = MagicMock(return_value=mock_ydl)
+            mock_ydl.return_value.__exit__ = MagicMock(return_value=False)
+            mock_ydl.extract_info.side_effect = [
+                {"entries": []},
+                {"entries": [topic_entry]},
+                hydrated,
+            ]
+            url = self._scraper()._select_youtube_match(
+                "ytsearch5:Home Right Artist audio",
+                200,
+                expected_title="Home",
+                expected_artists="Right Artist",
+            )
+        assert url is None
+
+    def test_topic_display_name_and_tags_do_not_prove_catalog_provenance(self):
+        """A user channel can type ` - Topic` and target tags; structured
+        auto-generated music metadata is still required."""
+        topic_entry = {
+            "id": "spoof",
+            "duration": 200,
+            "title": "翻訳題",
+            "channel": "Artist - Topic",
+        }
+        hydrated = {
+            **topic_entry,
+            "uploader": "Artist - Topic",
+            "track": "翻訳題",
+            "album": "Fake Album",
+            "artist": "Artist",
+            "tags": ["Artist", "Expected Song"],
+            "description": "Please subscribe to my channel",
+        }
+        with patch("Spotify_Downloader.YoutubeDL") as mock_ydl:
+            mock_ydl.return_value.__enter__ = MagicMock(return_value=mock_ydl)
+            mock_ydl.return_value.__exit__ = MagicMock(return_value=False)
+            mock_ydl.extract_info.side_effect = [
+                {"entries": []},
+                {"entries": [topic_entry]},
+                hydrated,
+            ]
+            url = self._scraper()._select_youtube_match(
+                "ytsearch5:Expected Song Artist audio",
+                200,
+                expected_title="Expected Song",
+                expected_artists="Artist",
+            )
+        assert url is None
+
+    def test_relaxed_catalog_path_sees_parenthetical_version_markers(self):
+        """A clean `track` field must not hide `(Piano Cover)` in the title."""
+        from Spotify_Downloader import MusicScraper
+
+        assert MusicScraper._has_conflicting_version_marker(
+            {
+                "title": "マルゲリータ（カラオケ）",
+                "track": "マルゲリータ",
+            },
+            "マルゲリータ",
+        )
+        topic_entry = {
+            "id": "piano",
+            "duration": 200,
+            "title": "翻訳題 (Piano Cover)",
+            "channel": "Artist",
+        }
+        hydrated = {
+            **topic_entry,
+            "uploader": "Artist",
+            "track": "翻訳題",
+            "artist": "Artist",
+            "tags": ["Artist", "Expected Song"],
+            "channel_is_verified": True,
+        }
+        with patch("Spotify_Downloader.YoutubeDL") as mock_ydl:
+            mock_ydl.return_value.__enter__ = MagicMock(return_value=mock_ydl)
+            mock_ydl.return_value.__exit__ = MagicMock(return_value=False)
+            mock_ydl.extract_info.side_effect = [
+                {"entries": []},
+                {"entries": [topic_entry]},
+                hydrated,
+            ]
+            url = self._scraper()._select_youtube_match(
+                "ytsearch5:Expected Song Artist audio",
+                200,
+                expected_title="Expected Song",
+                expected_artists="Artist",
+            )
+        assert url is None
+
+    def test_relaxed_catalog_path_requires_the_spotify_album(self):
+        """A licensed karaoke/tribute release is still the wrong recording."""
+        topic_entry = {
+            "id": "karaoke",
+            "duration": 183,
+            "title": "マルゲリータ + アイナ・ジ・エンド",
+            "channel": "Karaoke Catalog",
+        }
+        hydrated = {
+            **topic_entry,
+            "uploader": "Karaoke Catalog",
+            "track": "マルゲリータ + アイナ・ジ・エンド",
+            "artist": "Kenshi Yonezu, AiNA THE END",
+            "album": "Japanese Karaoke Hits",
+            "tags": ["Kenshi Yonezu", "AiNA THE END", "MARGHERITA + AiNA THE END"],
+            "channel_is_verified": True,
+        }
+        with patch("Spotify_Downloader.YoutubeDL") as mock_ydl:
+            mock_ydl.return_value.__enter__ = MagicMock(return_value=mock_ydl)
+            mock_ydl.return_value.__exit__ = MagicMock(return_value=False)
+            mock_ydl.extract_info.side_effect = [
+                {"entries": []},
+                {"entries": [topic_entry]},
+                hydrated,
+            ]
+            url = self._scraper()._select_youtube_match(
+                "ytsearch5:マルゲリータ Kenshi Yonezu audio",
+                183,
+                expected_title="MARGHERITA + AiNA THE END",
+                expected_artists="Kenshi Yonezu, AiNA THE END",
+                expected_album="LOST CORNER",
+            )
+        assert url is None
+
+    def test_catalog_recovery_rejects_ambiguous_official_aliases(self):
+        """All five hits are hydrated, so a fifth-hit conflict is not hidden."""
+        entries = [
+            {
+                "id": candidate_id,
+                "duration": 200 + index,
+                "title": "翻訳題",
+                "channel": "Artist",
+            }
+            for index, candidate_id in enumerate(("one", "two", "three", "four", "five"))
+        ]
+        hydrated = [
+            {
+                **entry,
+                "uploader": "Artist",
+                "track": "翻訳題",
+                "artist": "Artist",
+                "tags": ["Expected Song" if index in (0, 4) else "Other Song"],
+                "channel_is_verified": True,
+            }
+            for index, entry in enumerate(entries)
+        ]
+        with patch("Spotify_Downloader.YoutubeDL") as mock_ydl:
+            mock_ydl.return_value.__enter__ = MagicMock(return_value=mock_ydl)
+            mock_ydl.return_value.__exit__ = MagicMock(return_value=False)
+            mock_ydl.extract_info.side_effect = [
+                {"entries": []},
+                {"entries": entries},
+                *hydrated,
+            ]
+            url = self._scraper()._select_youtube_match(
+                "ytsearch5:Expected Song Artist audio",
+                200,
+                expected_title="Expected Song",
+                expected_artists="Artist",
+            )
+        assert url is None
+
+    def test_exact_album_resolves_two_catalog_aliases(self):
+        """The original OST beats an arranged release only when Spotify's
+        album exactly identifies it."""
+        entries = [
+            {
+                "id": "original",
+                "duration": 271,
+                "title": "異形ノ末路",
+                "channel": "Keiichi Okabe",
+            },
+            {
+                "id": "arranged",
+                "duration": 276,
+                "title": "異形ノ末路 Arranged by ATOLS",
+                "channel": "Keiichi Okabe",
+            },
+        ]
+        hydrated = [
+            {
+                **entries[0],
+                "uploader": "Keiichi Okabe",
+                "track": "異形ノ末路",
+                "artist": "Keiichi Okabe",
+                "album": "NieR:Automata Original Soundtrack",
+                "tags": ["Keiichi Okabe", "End of the Unknown"],
+                "channel_is_verified": True,
+                "description": "Provided to YouTube\nAuto-generated by YouTube.",
+            },
+            {
+                **entries[1],
+                "uploader": "Keiichi Okabe",
+                "track": "異形ノ末路 Arranged by ATOLS",
+                "artist": "Keiichi Okabe, ATOLS",
+                "album": "NieR:Automata Arranged & Unreleased Tracks",
+                "tags": ["Keiichi Okabe", "End of the Unknown"],
+                "channel_is_verified": True,
+                "description": "Provided to YouTube\nAuto-generated by YouTube.",
+            },
+        ]
+        with patch("Spotify_Downloader.YoutubeDL") as mock_ydl:
+            mock_ydl.return_value.__enter__ = MagicMock(return_value=mock_ydl)
+            mock_ydl.return_value.__exit__ = MagicMock(return_value=False)
+            mock_ydl.extract_info.side_effect = [
+                {"entries": []},
+                {"entries": entries},
+                *hydrated,
+            ]
+            url = self._scraper()._select_youtube_match(
+                "ytsearch5:End of the Unknown Keiichi Okabe audio",
+                271.066,
+                expected_title="End of the Unknown",
+                expected_artists="Keiichi Okabe",
+                expected_album="NieR:Automata Original Soundtrack",
+            )
+        assert url == "https://www.youtube.com/watch?v=original"
+
+    @pytest.mark.parametrize(
+        (
+            "expected_title",
+            "expected_artists",
+            "expected_album",
+            "duration",
+            "discovery_query",
+            "candidate",
+        ),
+        [
+            (
+                "Herald of Darkness - Video Edit",
+                "Old Gods of Asgard, Alan Wake, Mr. Door",
+                "Herald of Darkness",
+                517.692,
+                'ytsearch5:"Herald of Darkness (Video Edit)" "Old Gods of Asgard"',
+                {
+                    "id": "LPAttydeahg",
+                    "duration": 518,
+                    "title": "Herald of Darkness (Video Edit)",
+                    "channel": "Old Gods of Asgard",
+                },
+            ),
+            (
+                "in the pool",
+                "kensuke ushio",
+                "CHAINSAW MAN THE MOVIE: REZE ARC original soundtrack -summer's end-",
+                245.440,
+                'ytsearch5:"in the pool" "kensuke ushio" "Auto-generated by YouTube"',
+                {
+                    "id": "Y3UH_9ZV1-A",
+                    "duration": 245,
+                    "title": "in the pool",
+                    "channel": "kensuke ushio - Topic",
+                },
+            ),
+            (
+                "His Dream",
+                "SQUARE ENIX MUSIC",
+                "NieR Gestalt & NieR Replicant Original Soundtrack",
+                117.080,
+                'ytsearch5:"His Dream (NieR Gestalt & NieR Replicant Original Soundtrack)" '
+                '"SQUARE ENIX MUSIC"',
+                {
+                    "id": "XFzj08quMpw",
+                    "duration": 117,
+                    "title": "His Dream (NieR Gestalt & Replicant Original Soundtrack) 【Audio】",
+                    "channel": "SQUARE ENIX MUSIC Channel",
+                },
+            ),
+        ],
+    )
+    def test_targeted_catalog_queries_find_exact_remaining_editions(
+        self,
+        expected_title,
+        expected_artists,
+        expected_album,
+        duration,
+        discovery_query,
+        candidate,
+    ):
+        """Quoted edition/auto-generated/soundtrack queries recover exact art tracks."""
+        broad_query = f"ytsearch5:{expected_title} {expected_artists} audio"
+        searches = {discovery_query: [candidate]}
+        with patch("Spotify_Downloader.YoutubeDL") as mock_ydl:
+            mock_ydl.return_value.__enter__ = MagicMock(return_value=mock_ydl)
+            mock_ydl.return_value.__exit__ = MagicMock(return_value=False)
+            mock_ydl.extract_info.side_effect = lambda query, download=False: {
+                "entries": searches.get(query, [])
+            }
+            url = self._scraper()._select_youtube_match(
+                broad_query,
+                duration,
+                expected_title=expected_title,
+                expected_artists=expected_artists,
+                expected_album=expected_album,
+            )
+        assert url == f"https://www.youtube.com/watch?v={candidate['id']}"
+
+    @pytest.mark.parametrize(
+        ("expected_title", "expected_album", "candidate_title", "candidate_album", "video_id"),
+        [
+            (
+                "マルゲリータ ＋ アイナ・ジ・エンド",
+                "LOST CORNER",
+                "MARGHERITA + AiNA THE END",
+                "LOST CORNER",
+                "HfSwIrPogeY",
+            ),
+            ("Docchi", "INDIES COMPLETE", "どっち", "助演男優賞", "zJDUFIVRsJw"),
+            ("紙様", "クリープ・ショー", "Kamisama", "Creep Show", "xL_PYnxkMm8"),
+            (
+                "Tarinaifutari",
+                "INDIES COMPLETE",
+                "たりないふたり",
+                "たりないふたり",
+                "OiptKns1l4A",
+            ),
+        ],
+    )
+    def test_verified_catalog_bridge_recovers_localized_title(
+        self, expected_title, expected_album, candidate_title, candidate_album, video_id
+    ):
+        """A verified artist result can bridge scripts, but only to an art track."""
+        artists = "Kenshi Yonezu, AiNA THE END" if video_id == "HfSwIrPogeY" else "Creepy Nuts"
+        duration = {
+            "HfSwIrPogeY": 183.120,
+            "zJDUFIVRsJw": 297.373,
+            "xL_PYnxkMm8": 199.626,
+            "OiptKns1l4A": 227.090,
+        }[video_id]
+        flat = {
+            "id": video_id,
+            "duration": 230 if video_id == "OiptKns1l4A" else round(duration),
+            "title": candidate_title,
+            "channel": artists.split(",")[0],
+            "uploader": artists.split(",")[0],
+            "channel_is_verified": True,
+        }
+        hydrated = {
+            **flat,
+            "track": candidate_title,
+            "album": candidate_album,
+            "artist": artists,
+            "artists": [part.strip() for part in artists.split(",")],
+            "description": "Provided to YouTube\nAuto-generated by YouTube.",
+        }
+        topic_query = self._scraper()._topic_search_query(expected_title, artists)
+
+        def extract(query, download=False):
+            if query == f"https://www.youtube.com/watch?v={video_id}":
+                return hydrated
+            if query == topic_query and video_id != "HfSwIrPogeY":
+                return {"entries": [flat]}
+            # Margherita needs its album query because its Japanese search
+            # does not surface the English art-track title.
+            if video_id == "HfSwIrPogeY" and "LOST CORNER" in query:
+                return {"entries": [flat]}
+            return {"entries": []}
+
+        with patch("Spotify_Downloader.YoutubeDL") as mock_ydl:
+            mock_ydl.return_value.__enter__ = MagicMock(return_value=mock_ydl)
+            mock_ydl.return_value.__exit__ = MagicMock(return_value=False)
+            mock_ydl.extract_info.side_effect = extract
+            url = self._scraper()._select_youtube_match(
+                f"ytsearch5:{expected_title} {artists} audio",
+                duration,
+                expected_title=expected_title,
+                expected_artists=artists,
+                expected_album=expected_album,
+            )
+        assert url == f"https://www.youtube.com/watch?v={video_id}"
+
+    def test_verified_native_bridge_selects_joendanyusho_not_same_length_neighbor(self):
+        """The MV supplies 助演男優賞; a different 239s Creepy Nuts song cannot win."""
+        mv = {
+            "id": "JEUOTHxL8Xw",
+            "duration": 341,
+            "title": "【MV】Creepy Nuts - 助演男優賞",
+            "channel": "Creepy Nuts",
+            "uploader": "Creepy Nuts",
+            "channel_is_verified": True,
+        }
+        correct = {
+            "id": "lOJdTHeVbLM",
+            "duration": 240,
+            "title": "助演男優賞",
+            "channel": "Creepy Nuts",
+            "uploader": "Creepy Nuts",
+            "channel_is_verified": True,
+        }
+        wrong = {
+            "id": "hhFXJcgpUj0",
+            "duration": 239,
+            "title": "合法的トビ方ノススメ",
+            "channel": "Creepy Nuts",
+            "uploader": "Creepy Nuts",
+            "channel_is_verified": True,
+        }
+
+        def art_track(entry):
+            return {
+                **entry,
+                "track": entry["title"],
+                "album": "助演男優賞",
+                "artist": "Creepy Nuts",
+                "artists": ["Creepy Nuts"],
+                "description": "Provided to YouTube\nAuto-generated by YouTube.",
+            }
+
+        def extract(query, download=False):
+            if query == "https://www.youtube.com/watch?v=JEUOTHxL8Xw":
+                return mv
+            if query == "https://www.youtube.com/watch?v=lOJdTHeVbLM":
+                return art_track(correct)
+            if query == "https://www.youtube.com/watch?v=hhFXJcgpUj0":
+                return art_track(wrong)
+            if query == 'ytsearch5:"助演男優賞" "Creepy Nuts" Topic':
+                return {"entries": [correct, wrong]}
+            if query == "ytsearch5:Joendanyusho Creepy Nuts audio":
+                return {"entries": [mv]}
+            return {"entries": []}
+
+        with patch("Spotify_Downloader.YoutubeDL") as mock_ydl:
+            mock_ydl.return_value.__enter__ = MagicMock(return_value=mock_ydl)
+            mock_ydl.return_value.__exit__ = MagicMock(return_value=False)
+            mock_ydl.extract_info.side_effect = extract
+            url = self._scraper()._select_youtube_match(
+                "ytsearch5:Joendanyusho Creepy Nuts audio",
+                239.826,
+                expected_title="Joendanyusho",
+                expected_artists="Creepy Nuts",
+                expected_album="INDIES COMPLETE",
+            )
+        assert url == "https://www.youtube.com/watch?v=lOJdTHeVbLM"
 
     def test_latin_matching_pins_unchanged(self):
         """Pin the exact normalized forms the #52 guardrail decisions rely on;
@@ -1772,14 +2653,14 @@ class TestCoverEnrichment:
     release_date too, and falls back gracefully on enrichment failure.
     """
 
-    def _track(self, tid="id1", cover=None, release_date=None):
+    def _track(self, tid="id1", cover=None, release_date=None, album=None):
         from spotifydown_api import TrackInfo
 
         return TrackInfo(
             id=tid,
             title="Song",
             artists="Artist",
-            album=None,
+            album=album,
             release_date=release_date,
             cover_url=cover,
             duration_ms=None,
@@ -1823,6 +2704,33 @@ class TestCoverEnrichment:
         assert captured[0]["cover"] == "https://real/cover.jpg"
         assert captured[0]["releaseDate"] == "2024-06-01"
         mock_api.get_track.assert_called_once_with("id1")
+
+    def test_enrichment_passes_missing_album_to_matcher_and_tags(self, tmp_path):
+        """Compact playlist rows must not discard the per-track album lookup."""
+        from Spotify_Downloader import MusicScraper
+
+        scraper = MusicScraper()
+        self._stub_scraper_signals(scraper)
+        download_kwargs = {}
+
+        def download(_query, destination, **kwargs):
+            download_kwargs.update(kwargs)
+            Path(destination).write_bytes(b"audio")
+            return destination
+
+        scraper.download_track_audio = download
+        mock_api = MagicMock()
+        mock_api.get_track.return_value = self._track(
+            cover="https://real/cover.jpg", album="Exact Album"
+        )
+        scraper.spotifydown_api = mock_api
+        tagged = []
+        scraper.add_song_meta.emit.side_effect = tagged.append
+
+        scraper._download_one_track(self._track(cover=None), str(tmp_path), "fallback")
+
+        assert download_kwargs["expected_album"] == "Exact Album"
+        assert tagged[0]["album"] == "Exact Album"
 
     def test_existing_cover_skips_enrichment(self, tmp_path):
         """Track that already has cover_url (e.g. spclient fallback path) does
