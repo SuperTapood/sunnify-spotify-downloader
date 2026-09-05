@@ -10,12 +10,16 @@ from Spotify's embed pages.
 
 from __future__ import annotations
 
+import concurrent.futures
 import functools
 import json
 import logging
 import re
+import threading
 import time
 import unicodedata
+import weakref
+from collections import OrderedDict
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
 from typing import Any, TypeVar
@@ -156,7 +160,20 @@ class SpotifyEmbedAPI:
     _NEXT_DATA_PATTERN = re.compile(r'<script id="__NEXT_DATA__"[^>]*>([^<]+)</script>')
 
     def __init__(self, *, session: requests.Session | None = None) -> None:
+        # requests.Session is not documented as thread-safe. Per-track
+        # enrichment runs concurrently, so sessions we create are pooled per
+        # worker thread. An explicitly injected session stays untouched for
+        # callers that provide a custom adapter or test double.
         self._session = session or requests.Session()
+        self._session_is_injected = session is not None
+        self._session_owner_thread = threading.get_ident()
+        self._thread_local = threading.local()
+        self._owned_sessions: weakref.WeakSet[requests.Session] = weakref.WeakSet()
+        if session is None:
+            self._owned_sessions.add(self._session)
+        self._sessions_lock = threading.Lock()
+        self._metadata_pool_lock = threading.Lock()
+        self._metadata_pool: concurrent.futures.ThreadPoolExecutor | None = None
         self._cached_token: str | None = None
         self._token_expiry: float = 0
         # Per-instance album cache (track_id -> album name or None). FIFO-
@@ -166,6 +183,95 @@ class SpotifyEmbedAPI:
         # because the lru_cache decorator on a method keeps self alive for
         # the lifetime of the process (B019).
         self._album_cache: dict[str, str | None] = {}
+        self._album_cache_lock = threading.Lock()
+        # Every download asks for collection metadata and then its tracks.
+        # Retain those two just-fetched snapshots for the second call instead
+        # of hitting both Spotify endpoints twice.
+        self._snapshot_cache_lock = threading.Lock()
+        self._collection_cache: OrderedDict[tuple[str, str], dict] = OrderedDict()
+        self._spclient_cache: OrderedDict[str, dict] = OrderedDict()
+
+    def _remember_collection_snapshot(self, key: tuple[str, str], data: dict) -> None:
+        with self._snapshot_cache_lock:
+            self._collection_cache[key] = data
+            self._collection_cache.move_to_end(key)
+            while len(self._collection_cache) > 8:
+                self._collection_cache.popitem(last=False)
+
+    def _take_collection_snapshot(self, key: tuple[str, str]) -> dict | None:
+        with self._snapshot_cache_lock:
+            return self._collection_cache.pop(key, None)
+
+    def _remember_spclient_snapshot(self, playlist_id: str, data: dict) -> None:
+        with self._snapshot_cache_lock:
+            self._spclient_cache[playlist_id] = data
+            self._spclient_cache.move_to_end(playlist_id)
+            while len(self._spclient_cache) > 8:
+                self._spclient_cache.popitem(last=False)
+
+    def _take_spclient_snapshot(self, playlist_id: str) -> dict | None:
+        with self._snapshot_cache_lock:
+            return self._spclient_cache.pop(playlist_id, None)
+
+    def _request_session(self) -> requests.Session:
+        """Return a connection-pooled session safe for the current thread."""
+        if self._session_is_injected or threading.get_ident() == self._session_owner_thread:
+            return self._session
+        worker_session = getattr(self._thread_local, "session", None)
+        if worker_session is None:
+            worker_session = requests.Session()
+            self._thread_local.session = worker_session
+            with self._sessions_lock:
+                self._owned_sessions.add(worker_session)
+            # A threaded WSGI server may create a fresh request thread for
+            # every call. Close its pool when that Thread object dies instead
+            # of retaining one Session per historical request forever.
+            weakref.finalize(threading.current_thread(), worker_session.close)
+        return worker_session
+
+    def _get_metadata_pool(self) -> concurrent.futures.ThreadPoolExecutor:
+        """Return the bounded pool shared by large-playlist metadata fetches."""
+        with self._metadata_pool_lock:
+            if self._metadata_pool is None:
+                self._metadata_pool = concurrent.futures.ThreadPoolExecutor(
+                    max_workers=4, thread_name_prefix="sunnify-meta"
+                )
+            return self._metadata_pool
+
+    def close(self) -> None:
+        """Close every HTTP connection pool owned by this client."""
+        with self._metadata_pool_lock:
+            metadata_pool, self._metadata_pool = self._metadata_pool, None
+        if metadata_pool is not None:
+            metadata_pool.shutdown(wait=False, cancel_futures=True)
+        sessions: list[requests.Session] = []
+        if not self._session_is_injected:
+            with self._sessions_lock:
+                sessions = list(self._owned_sessions)
+                self._owned_sessions.clear()
+        for owned_session in sessions:
+            owned_session.close()
+        with self._snapshot_cache_lock:
+            self._collection_cache.clear()
+            self._spclient_cache.clear()
+        with self._album_cache_lock:
+            self._album_cache.clear()
+
+    def _fetch_spclient_data(self, playlist_id: str, timeout: int) -> dict | None:
+        """Return a cached/full spclient snapshot, or None on a soft failure."""
+        cached = self._take_spclient_snapshot(playlist_id)
+        if cached is not None:
+            return cached
+        token = self._cached_token
+        if not token:
+            return None
+        spclient_url = self._SPCLIENT_URL.format(playlist_id=playlist_id)
+        headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+        response = self._request_session().get(spclient_url, headers=headers, timeout=timeout)
+        if response.status_code != 200:
+            return None
+        payload = response.json()
+        return payload if isinstance(payload, dict) else None
 
     @staticmethod
     def _deep_find(data: dict, key: str, max_depth: int = 6) -> dict | None:
@@ -212,7 +318,7 @@ class SpotifyEmbedAPI:
             ExtractionError: When page structure is unexpected (not retryable)
         """
         try:
-            response = self._session.get(url, headers=self._headers(), timeout=30)
+            response = self._request_session().get(url, headers=self._headers(), timeout=30)
         except (requests.Timeout, requests.ConnectionError) as exc:
             raise NetworkError(f"Network error fetching embed page: {exc}") from exc
         except requests.RequestException as exc:
@@ -237,6 +343,8 @@ class SpotifyEmbedAPI:
             data = json.loads(match.group(1))
         except json.JSONDecodeError as exc:
             raise ExtractionError(f"Invalid JSON in __NEXT_DATA__: {exc}") from exc
+        if not isinstance(data, dict):
+            raise ExtractionError("Spotify embed __NEXT_DATA__ was not a JSON object")
 
         # Cache the access token if present (try multiple paths)
         _TOKEN_PATHS = (
@@ -247,9 +355,12 @@ class SpotifyEmbedAPI:
         for path in _TOKEN_PATHS:
             session_data = self._resolve_path(data, path)
             if isinstance(session_data, dict) and "accessToken" in session_data:
-                self._cached_token = session_data.get("accessToken")
+                access_token = session_data.get("accessToken")
+                self._cached_token = access_token if isinstance(access_token, str) else None
                 expiry_ms = session_data.get("accessTokenExpirationTimestampMs", 0)
-                self._token_expiry = expiry_ms / 1000 if expiry_ms else 0
+                self._token_expiry = (
+                    float(expiry_ms) / 1000 if isinstance(expiry_ms, (int, float)) else 0
+                )
                 break
 
         return data
@@ -327,6 +438,7 @@ class SpotifyEmbedAPI:
         """
         url = self._embed_url_for(playlist_id, content_type)
         data = self._fetch_embed_data(url)
+        self._remember_collection_snapshot((content_type, playlist_id), data)
         entity = self._extract_entity(data)
 
         name = entity.get("name") or entity.get("title") or "Unknown Playlist"
@@ -352,16 +464,12 @@ class SpotifyEmbedAPI:
         # in the embed payload, so there's nothing more to fetch.
         if content_type == "playlist":
             try:
-                token = self._cached_token
-                if token:
-                    spclient_url = self._SPCLIENT_URL.format(playlist_id=playlist_id)
-                    headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
-                    resp = self._session.get(spclient_url, headers=headers, timeout=10)
-                    if resp.status_code == 200:
-                        spc_data = resp.json()
-                        track_count = spc_data.get("length", track_count)
-            except Exception:
-                pass  # Fall back to embed count
+                spc_data = self._fetch_spclient_data(playlist_id, timeout=10)
+                if spc_data is not None:
+                    self._remember_spclient_snapshot(playlist_id, spc_data)
+                    track_count = spc_data.get("length", track_count)
+            except (requests.RequestException, ValueError, TypeError) as exc:
+                log.debug("spclient metadata refinement failed: %s", exc)
 
         return PlaylistInfo(
             name=str(name),
@@ -396,7 +504,10 @@ class SpotifyEmbedAPI:
         """
         skip_ids = skip_ids or frozenset()
         url = self._embed_url_for(playlist_id, content_type)
-        data = self._fetch_embed_data(url)
+        cache_key = (content_type, playlist_id)
+        data = self._take_collection_snapshot(cache_key)
+        if data is None:
+            data = self._fetch_embed_data(url)
         entity = self._extract_entity(data)
 
         track_list = entity.get("trackList", [])
@@ -441,14 +552,9 @@ class SpotifyEmbedAPI:
             return
 
         try:
-            spclient_url = self._SPCLIENT_URL.format(playlist_id=playlist_id)
-            headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
-            resp = self._session.get(spclient_url, headers=headers, timeout=30)
-
-            if resp.status_code != 200:
+            spc_data = self._fetch_spclient_data(playlist_id, timeout=30)
+            if spc_data is None:
                 return
-
-            spc_data = resp.json()
             total_tracks = spc_data.get("length", 0)
 
             if total_tracks <= len(embed_track_ids):
@@ -494,24 +600,24 @@ class SpotifyEmbedAPI:
             # available. The downloader uses TrackInfo.position to write the
             # right number into the filename / TRCK tag, so this completion
             # ordering is invisible in the final output.
-            import concurrent.futures as _cf
-
-            # Manual executor lifecycle so GeneratorExit (caller break on cancel)
-            # can shut the pool down with cancel_futures=True instead of blocking
-            # on ~700 pending HTTP fetches inside the implicit __exit__.
-            pool = _cf.ThreadPoolExecutor(max_workers=4, thread_name_prefix="sunnify-meta")
+            # The client owns a persistent bounded pool. Reusing it keeps both
+            # worker threads and their thread-local HTTP sessions bounded when
+            # a long-running backend handles many playlists.
+            pool = self._get_metadata_pool()
+            futures: list[concurrent.futures.Future[TrackInfo | None]] = []
             try:
                 future_to_info = {
                     pool.submit(self._fetch_track_metadata, tid): (tid, uri) for tid, uri in pending
                 }
-                for future in _cf.as_completed(future_to_info):
+                futures = list(future_to_info)
+                for future in concurrent.futures.as_completed(future_to_info):
                     track_id, uri = future_to_info[future]
                     try:
-                        info = future.result()
+                        fetched_info = future.result()
                     except Exception:
-                        info = None
-                    if info is None:
-                        info = TrackInfo(
+                        fetched_info = None
+                    if fetched_info is None:
+                        fetched_info = TrackInfo(
                             id=track_id,
                             title=f"Track {track_id}",
                             artists="Unknown Artist",
@@ -522,13 +628,16 @@ class SpotifyEmbedAPI:
                             preview_url=None,
                             raw={"uri": uri},
                         )
-                    info.position = position_map.get(track_id)
-                    yield info
+                    fetched_info.position = position_map.get(track_id)
+                    yield fetched_info
             finally:
-                pool.shutdown(wait=False, cancel_futures=True)
+                # GeneratorExit/cancellation should not leave hundreds of this
+                # playlist's queued tasks consuming the shared pool later.
+                for future in futures:
+                    future.cancel()
 
-        except Exception:
-            pass  # spclient fallback failed, just return what we have
+        except (requests.RequestException, ValueError, TypeError) as exc:
+            log.debug("spclient track fallback failed: %s", exc)
 
     def _parse_track(self, track: dict, track_id: str) -> TrackInfo:
         """Parse a track dict from embed trackList."""
@@ -614,8 +723,9 @@ class SpotifyEmbedAPI:
         same retry/backoff `_fetch_embed_data` uses so transient network
         errors don't silently drop the album tag for that track.
         """
-        if track_id in self._album_cache:
-            return self._album_cache[track_id]
+        with self._album_cache_lock:
+            if track_id in self._album_cache:
+                return self._album_cache[track_id]
 
         @retry_on_network_error(
             max_attempts=3,
@@ -629,7 +739,7 @@ class SpotifyEmbedAPI:
             headers = dict(self._headers())
             headers["user-agent"] = self._SOCIAL_CRAWLER_UA
             try:
-                resp = self._session.get(url, headers=headers, timeout=15)
+                resp = self._request_session().get(url, headers=headers, timeout=15)
             except (requests.Timeout, requests.ConnectionError) as exc:
                 raise NetworkError(f"Network error fetching track page: {exc}") from exc
             except requests.RequestException:
@@ -647,9 +757,14 @@ class SpotifyEmbedAPI:
         # Simple bound; evict oldest if we hit capacity. lru would be nicer
         # but dict insertion order + popitem(last=False) gives FIFO which
         # is plenty for a per-session deduplication cache.
-        if len(self._album_cache) >= 256:
-            self._album_cache.pop(next(iter(self._album_cache)))
-        self._album_cache[track_id] = album
+        with self._album_cache_lock:
+            # A duplicate lookup may have completed while this request was in
+            # flight. Keep its result and preserve the original FIFO order.
+            if track_id in self._album_cache:
+                return self._album_cache[track_id]
+            if len(self._album_cache) >= 256:
+                self._album_cache.pop(next(iter(self._album_cache)))
+            self._album_cache[track_id] = album
         return album
 
     def _fetch_track_metadata(self, track_id: str) -> TrackInfo | None:
@@ -720,8 +835,8 @@ class SpotifyEmbedAPI:
         """Quick validation using oEmbed API (no full data fetch)."""
         try:
             params = {"url": f"https://open.spotify.com/playlist/{playlist_id}"}
-            resp = self._session.get(self._OEMBED_URL, params=params, timeout=10)
-            return resp.status_code == 200
+            resp = self._request_session().get(self._OEMBED_URL, params=params, timeout=10)
+            return bool(resp.status_code == 200)
         except Exception:
             return False
 
@@ -814,8 +929,14 @@ class PlaylistClient:
         session: requests.Session | None = None,
         base_urls: Sequence[str] | None = None,  # Ignored - kept for compatibility
     ) -> None:
-        self._session = session or requests.Session()
-        self._embed_api = SpotifyEmbedAPI(session=self._session)
+        self._embed_api = SpotifyEmbedAPI(session=session)
+        # Compatibility attribute retained for callers that inspect/customize
+        # the primary session. Worker calls are routed by SpotifyEmbedAPI.
+        self._session = self._embed_api._session
+
+    def close(self) -> None:
+        """Release connection pools created by this client."""
+        self._embed_api.close()
 
     def get_playlist_metadata(
         self, playlist_id: str, content_type: str = "playlist"
@@ -1008,7 +1129,7 @@ def sanitize_filename(name: str, allow_spaces: bool = True) -> str:
     return sanitized
 
 
-def cap_filename(name: str, max_bytes: int = 250) -> str:
+def cap_filename(name: str, max_bytes: int = 250, *, preserve_stem_suffix: str = "") -> str:
     """Cap a complete filename (incl. extension) to a length valid everywhere.
 
     The per-component limit is 255 bytes on ext4 (the strictest in bytes), 255
@@ -1017,7 +1138,9 @@ def cap_filename(name: str, max_bytes: int = 250) -> str:
     this - only pathological or troll-length titles, which would otherwise fail
     to write with ENAMETOOLONG and silently drop the track. Truncates on a
     codepoint boundary, preserves the extension, and re-trims trailing space/dot
-    so the cut can't reintroduce a Windows-invalid trailing character.
+    so the cut can't reintroduce a Windows-invalid trailing character. A caller
+    may also preserve a short suffix immediately before the extension (for
+    example a collision-disambiguating Spotify id).
 
     refs: POSIX NAME_MAX https://pubs.opengroup.org/onlinepubs/9699919799/basedefs/limits.h.html
     ; Linux per-fs filename limit https://man7.org/linux/man-pages/man7/inode.7.html
@@ -1029,9 +1152,16 @@ def cap_filename(name: str, max_bytes: int = 250) -> str:
     if not dot or not ext or len(ext) > 10 or " " in ext:
         stem, ext = name, ""
     suffix = f".{ext}" if ext else ""
-    budget = max(1, max_bytes - len(suffix.encode("utf-8")))
+    kept_stem_suffix = ""
+    if preserve_stem_suffix and stem.endswith(preserve_stem_suffix):
+        proposed_suffix = f"{preserve_stem_suffix}{suffix}"
+        if len(proposed_suffix.encode("utf-8")) < max_bytes:
+            stem = stem[: -len(preserve_stem_suffix)]
+            kept_stem_suffix = preserve_stem_suffix
+    fixed_suffix = f"{kept_stem_suffix}{suffix}"
+    budget = max(1, max_bytes - len(fixed_suffix.encode("utf-8")))
     stem = stem.encode("utf-8")[:budget].decode("utf-8", "ignore").rstrip(" .")
-    return f"{stem}{suffix}" if stem else f"file{suffix}"
+    return f"{stem}{fixed_suffix}" if stem else f"file{fixed_suffix}"
 
 
 __all__ = [

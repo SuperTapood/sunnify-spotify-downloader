@@ -264,9 +264,3 @@ def sample_embed_html_no_state():
 def sample_embed_html_flat():
     """Return sample embed HTML with flat entity structure."""
     return SAMPLE_EMBED_HTML_FLAT
-
-
-@pytest.fixture
-def mock_session(mocker):
-    """Create a mock requests session."""
-    return mocker.MagicMock()
