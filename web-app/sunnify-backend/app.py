@@ -8,13 +8,14 @@ For actual MP3 downloads, use the desktop app.
 
 from __future__ import annotations
 
-import gc
 import os
 import sys
+import threading
 from pathlib import Path
 
 from flask import Flask, jsonify, request
 from flask_cors import CORS
+from werkzeug.exceptions import RequestEntityTooLarge
 
 # Add parent directory to path for spotifydown_api import
 ROOT = Path(__file__).resolve().parent.parent.parent
@@ -24,22 +25,25 @@ if str(ROOT) not in sys.path:
 from spotifydown_api import (  # noqa: E402
     PlaylistClient,
     SpotifyDownAPIError,
-    SpotifyEmbedAPI,
     detect_spotify_url_type,
 )
 
 app = Flask(__name__)
+app.config["MAX_CONTENT_LENGTH"] = 16 * 1024
 CORS(app)
 
 # Reusable client (saves memory on repeated requests)
 _playlist_client: PlaylistClient | None = None
+_playlist_client_lock = threading.Lock()
 
 
 def get_playlist_client() -> PlaylistClient:
     """Get or create a playlist client (singleton pattern for memory efficiency)."""
     global _playlist_client
     if _playlist_client is None:
-        _playlist_client = PlaylistClient()
+        with _playlist_client_lock:
+            if _playlist_client is None:
+                _playlist_client = PlaylistClient()
     return _playlist_client
 
 
@@ -59,14 +63,24 @@ def scrape_playlist():
         {"event": "complete", "data": {"playlistName": "...", "tracks": [...]}}
     """
     try:
-        data = request.get_json()
-        spotify_url = data.get("playlistUrl", "").strip()
+        data = request.get_json(silent=True)
+        if not isinstance(data, dict):
+            return jsonify({"event": "error", "data": {"message": "Invalid JSON body"}}), 400
+        raw_url = data.get("playlistUrl", "")
+        if not isinstance(raw_url, str):
+            return jsonify({"event": "error", "data": {"message": "Invalid Spotify URL"}}), 400
+        spotify_url = raw_url.strip()
 
         if not spotify_url:
             return jsonify({"event": "error", "data": {"message": "No URL provided"}}), 400
 
-        # Detect URL type
-        url_type, item_id = detect_spotify_url_type(spotify_url)
+        # Only malformed input is a 400. ValueError raised later by Spotify
+        # parsing/conversion is a server-side failure and must not be
+        # misreported to the caller as a bad URL.
+        try:
+            url_type, item_id = detect_spotify_url_type(spotify_url)
+        except ValueError:
+            return jsonify({"event": "error", "data": {"message": "Invalid Spotify URL"}}), 400
 
         if url_type == "unknown" or not item_id:
             return (
@@ -78,9 +92,9 @@ def scrape_playlist():
         tracks: list[dict] = []
 
         if url_type == "track":
-            # Single track
-            api = SpotifyEmbedAPI()
-            track = api.get_track(item_id)
+            # Reuse the process-wide client and its pooled HTTP session instead
+            # of allocating an unclosed Session for every single-track request.
+            track = client.get_track(item_id)
             tracks.append(
                 {
                     "id": track.spotify_id,
@@ -116,13 +130,6 @@ def scrape_playlist():
                     }
                 )
 
-                # Memory management for large playlists
-                if len(tracks) % 50 == 0:
-                    gc.collect()
-
-        # Final cleanup
-        gc.collect()
-
         return jsonify(
             {
                 "event": "complete",
@@ -133,9 +140,8 @@ def scrape_playlist():
             }
         )
 
-    except ValueError:
-        # bad/unsupported spotify url is client input error, not a server fault
-        return jsonify({"event": "error", "data": {"message": "Invalid Spotify URL"}}), 400
+    except RequestEntityTooLarge:
+        return jsonify({"event": "error", "data": {"message": "Request body too large"}}), 413
     except SpotifyDownAPIError:
         # log the detail server-side; don't leak exception internals to the client
         app.logger.exception("spotify api error during scrape")

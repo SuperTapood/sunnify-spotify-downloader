@@ -300,6 +300,49 @@ class TestResumeManifest:
         scraper._record_in_manifest("id", str(tmp_path / "x.mp3"))
         assert self._scraper()._load_manifest(str(tmp_path)) == set()
 
+    def test_manifest_ignores_malformed_records_and_path_traversal(self, tmp_path):
+        """Valid JSON with the wrong shape must be as harmless as a torn line."""
+        import json
+
+        (tmp_path / "good.mp3").write_bytes(b"audio")
+        rows = [
+            "not-json",
+            json.dumps([]),
+            json.dumps("scalar"),
+            json.dumps({"id": 123, "file": "good.mp3"}),
+            json.dumps({"id": "escape", "file": "../outside.mp3"}),
+            json.dumps({"id": "parent", "file": ".."}),
+            json.dumps({"id": "drive", "file": "C:outside.mp3"}),
+            json.dumps({"id": "control", "file": "bad\u0000.mp3"}),
+            json.dumps({"id": "good", "file": "good.mp3"}),
+        ]
+        (tmp_path / ".sunnify-manifest.jsonl").write_text("\n".join(rows), encoding="utf-8")
+
+        assert self._scraper()._load_manifest(str(tmp_path)) == {"good"}
+
+    def test_manifest_does_not_append_duplicate_completion(self, tmp_path):
+        writer = self._scraper()
+        writer._load_manifest(str(tmp_path))
+        path = tmp_path / "song.mp3"
+        path.write_bytes(b"audio")
+
+        writer._record_in_manifest("track-id", str(path))
+        writer._record_in_manifest("track-id", str(path))
+
+        rows = (tmp_path / ".sunnify-manifest.jsonl").read_text(encoding="utf-8").splitlines()
+        assert len(rows) == 1
+
+    def test_manifest_resume_is_scoped_to_requested_audio_format(self, tmp_path):
+        mp3 = self._scraper()
+        mp3._load_manifest(str(tmp_path))
+        path = tmp_path / "song.mp3"
+        path.write_bytes(b"audio")
+        mp3._record_in_manifest("track-id", str(path))
+
+        from Spotify_Downloader import MusicScraper
+
+        assert MusicScraper(audio_format="flac")._load_manifest(str(tmp_path)) == set()
+
 
 class TestDownloadTrackAudioOpts:
     """Tests for yt-dlp performance options in download_track_audio."""
@@ -353,6 +396,112 @@ class TestDownloadTrackAudioOpts:
                 scraper.download_track_audio("test query", "/tmp/test.mp3")
             opts = mock_ydl.call_args[0][0]
             assert opts["concurrent_fragment_downloads"] == 4
+
+    def test_same_selected_video_is_not_downloaded_twice(self, tmp_path, monkeypatch):
+        """Widened/simplified queries can converge on one URL; retry it once."""
+        import Spotify_Downloader as module
+
+        scraper = module.MusicScraper()
+        monkeypatch.setattr(module, "get_ffmpeg_path", lambda: str(tmp_path))
+        monkeypatch.setattr(scraper, "_widen_search", lambda _query: "wide")
+        monkeypatch.setattr(scraper, "_simplify_search", lambda _query: "simple")
+        monkeypatch.setattr(
+            scraper,
+            "_select_youtube_match",
+            lambda *_args, **_kwargs: "https://www.youtube.com/watch?v=same",
+        )
+        download_calls = []
+
+        class FakeYDL:
+            def __init__(self, _opts):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def extract_info(self, url, download=False):
+                assert download is True
+                download_calls.append(url)
+                return None
+
+        monkeypatch.setattr(module, "YoutubeDL", FakeYDL)
+
+        with pytest.raises(RuntimeError, match="no playable audio"):
+            scraper.download_track_audio("query", str(tmp_path / "out.mp3"))
+
+        # Default clients + one fallback client-family attempt, not that pair
+        # repeated for the second query spelling.
+        assert download_calls == [
+            "https://www.youtube.com/watch?v=same",
+            "https://www.youtube.com/watch?v=same",
+        ]
+
+    def test_selector_bot_gate_sets_circuit_breaker(self, monkeypatch):
+        import Spotify_Downloader as module
+
+        scraper = module.MusicScraper()
+
+        class BlockedYDL:
+            def __init__(self, _opts):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def extract_info(self, *_args, **_kwargs):
+                raise RuntimeError("Sign in to confirm you're not a bot")
+
+        monkeypatch.setattr(module, "YoutubeDL", BlockedYDL)
+
+        assert scraper._select_youtube_match("ytsearch1:song", 100) is None
+        assert scraper._youtube_is_blocked()
+
+    def test_hydration_bot_gate_sets_circuit_breaker(self, monkeypatch):
+        import Spotify_Downloader as module
+
+        scraper = module.MusicScraper()
+        candidate = {
+            "id": "localized",
+            "title": "異形ノ末路",
+            "duration": 100,
+            "channel": "Artist - Topic",
+        }
+
+        class BlockedHydrationYDL:
+            def __init__(self, _opts):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def extract_info(self, query, download=False):
+                assert download is False
+                if query.startswith("https://www.youtube.com/"):
+                    raise RuntimeError("Sign in to confirm you're not a bot")
+                return {"entries": [candidate]}
+
+        monkeypatch.setattr(module, "YoutubeDL", BlockedHydrationYDL)
+
+        assert (
+            scraper._select_youtube_match(
+                "ytsearch5:End of the Unknown Artist audio",
+                100,
+                expected_title="End of the Unknown",
+                expected_artists="Artist",
+                expected_album="Album",
+            )
+            is None
+        )
+        assert scraper._youtube_is_blocked()
 
 
 class TestYoutubeMatchSelection:
@@ -645,10 +794,7 @@ class TestYoutubeMatchSelection:
         from Spotify_Downloader import MusicScraper
 
         assert MusicScraper._spotify_title_core("Emil - Despair") == "Emil - Despair"
-        assert (
-            MusicScraper._spotify_title_core("Dark Colossus - Kaiju")
-            == "Dark Colossus - Kaiju"
-        )
+        assert MusicScraper._spotify_title_core("Dark Colossus - Kaiju") == "Dark Colossus - Kaiju"
         assert MusicScraper._spotify_title_core("Hello - Live") == "Hello"
         assert (
             MusicScraper._spotify_title_core("Bohemian Rhapsody - Remastered 2011")
@@ -761,12 +907,11 @@ class TestYoutubeMatchSelection:
         Topic audio; the result sequence alone would not catch a bad query."""
         from Spotify_Downloader import MusicScraper
 
-        assert MusicScraper._topic_search_query(
-            "בנים כמוני לא בוכים", "Dudu Faruk, Noa Kirel"
-        ) == "ytsearch5:בנים כמוני לא בוכים Dudu Faruk Topic"
-        assert MusicScraper._topic_search_query("S&M", "Sabl3") == (
-            "ytsearch5:S & M Sabl3 Topic"
+        assert (
+            MusicScraper._topic_search_query("בנים כמוני לא בוכים", "Dudu Faruk, Noa Kirel")
+            == "ytsearch5:בנים כמוני לא בוכים Dudu Faruk Topic"
         )
+        assert MusicScraper._topic_search_query("S&M", "Sabl3") == ("ytsearch5:S & M Sabl3 Topic")
 
     def test_s_and_m_prefers_real_artist_credit_over_logged_audio_mix(self):
         """Regression for the exact false positive reproduced in the GUI log."""
@@ -1058,9 +1203,7 @@ class TestYoutubeMatchSelection:
             "id": "wrong",
             "duration": 117,
             "title": candidate_title,
-            "channel": "DJ Goja - Topic"
-            if expected_title == "Mi Gente"
-            else "MONACA - Topic",
+            "channel": "DJ Goja - Topic" if expected_title == "Mi Gente" else "MONACA - Topic",
         }
         hydrated = {
             **topic_entry,
@@ -1419,7 +1562,7 @@ class TestYoutubeMatchSelection:
             mock_ydl.return_value.__enter__ = MagicMock(return_value=mock_ydl)
             mock_ydl.return_value.__exit__ = MagicMock(return_value=False)
             mock_ydl.extract_info.side_effect = lambda query, download=False: {
-                "entries": searches.get(query, [])
+                "entries": searches.get(query, []) if not download else []
             }
             url = self._scraper()._select_youtube_match(
                 broad_query,
@@ -1830,6 +1973,81 @@ class TestFlacMetadata:
         assert len(audio.pictures) == 0
 
 
+class TestCoverCache:
+    def test_concurrent_same_url_is_single_flight(self):
+        import concurrent.futures
+        import time
+
+        import Spotify_Downloader as module
+
+        module._clear_cover_cache()
+        calls = []
+
+        class Response:
+            status_code = 200
+            content = b"cover-bytes"
+
+        def fetch(url, timeout):
+            calls.append((url, timeout))
+            time.sleep(0.05)
+            return Response()
+
+        try:
+            with (
+                patch.object(module.requests, "get", side_effect=fetch),
+                concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor,
+            ):
+                results = list(
+                    executor.map(
+                        module._fetch_cover_bytes,
+                        ["https://covers.example/one.jpg"] * 8,
+                    )
+                )
+            assert results == [b"cover-bytes"] * 8
+            assert calls == [("https://covers.example/one.jpg", 15)]
+        finally:
+            module._clear_cover_cache()
+
+    def test_scraper_writes_tags_before_reporting_track_done(self, tmp_path):
+        import Spotify_Downloader as module
+        from spotifydown_api import TrackInfo
+
+        scraper = module.MusicScraper(write_metadata=True)
+        for signal in (
+            "song_meta",
+            "add_song_meta",
+            "dlprogress_signal",
+            "count_updated",
+        ):
+            setattr(scraper, signal, MagicMock())
+
+        def download(_query, path, **_kwargs):
+            Path(path).write_bytes(b"audio")
+            return path
+
+        scraper.download_track_audio = download
+        track = TrackInfo(
+            id="id",
+            title="Song",
+            artists="Artist",
+            album="Album",
+            release_date="2026",
+            cover_url=None,
+            duration_ms=1000,
+            preview_url=None,
+            raw={},
+        )
+
+        with patch.object(
+            module, "_write_song_metadata", return_value="Tags added successfully"
+        ) as write:
+            scraper._download_one_track(track, str(tmp_path), None, track_num=1)
+
+        write.assert_called_once()
+        emitted = scraper.add_song_meta.emit.call_args.args[0]
+        assert emitted["_metadata_status"] == "Tags added successfully"
+
+
 class TestWritingMetaTagsThread:
     """Tests for WritingMetaTagsThread synchronous cover fetch."""
 
@@ -2214,6 +2432,53 @@ class TestParallelDownloads:
         assert all(tid == main_thread_id for tid in iter_threads)
         assert len(iter_threads) == 4
 
+    def test_known_count_starts_download_before_metadata_iteration_finishes(self, tmp_path):
+        """Real Spotify metadata has a count, enabling producer/download overlap."""
+        from Spotify_Downloader import MusicScraper
+
+        scraper = MusicScraper()
+        for sig in (
+            "song_meta",
+            "add_song_meta",
+            "dlprogress_signal",
+            "Resetprogress_signal",
+            "PlaylistID",
+            "song_Album",
+            "PlaylistCompleted",
+            "error_signal",
+            "count_updated",
+        ):
+            setattr(scraper, sig, MagicMock())
+
+        first_download_started = threading.Event()
+
+        def download(_query, destination, **_kwargs):
+            first_download_started.set()
+            Path(destination).write_bytes(b"audio")
+            return destination
+
+        def tracks():
+            yield self._make_track("id0", "Song 0")
+            assert first_download_started.wait(2), "metadata was fully buffered before download"
+            for i in range(1, 4):
+                yield self._make_track(f"id{i}", f"Song {i}")
+
+        scraper.download_track_audio = download
+        mock_api = MagicMock()
+        meta = MagicMock(name="metadata")
+        meta.name = "T"
+        meta.owner = "O"
+        meta.cover_url = None
+        meta.track_count = 4
+        mock_api.get_playlist_metadata.return_value = meta
+        mock_api.iter_playlist_tracks.return_value = tracks()
+        scraper.ensure_spotifydown_api = MagicMock(return_value=mock_api)
+        scraper.format_playlist_name = lambda _meta: "T"
+
+        scraper.scrape_playlist("https://open.spotify.com/playlist/abc", str(tmp_path))
+
+        assert scraper.counter == 4
+
     def test_cancel_before_threading_exits_early(self, tmp_path):
         """Cancel set before worker pool starts prevents any downloads."""
         from Spotify_Downloader import MusicScraper
@@ -2571,6 +2836,28 @@ class TestMainWindowInteractions:
         win.showPreviewCheck.setChecked(True)
         win.showPreviewCheck.setChecked(False)
 
+    def test_preview_thumbnail_threads_are_bounded(self, qapp, monkeypatch):
+        import Spotify_Downloader as module
+
+        monkeypatch.setattr(module.DownloadThumbnail, "start", lambda _self: None)
+        win = module.MainWindow()
+        win.showPreviewCheck.setChecked(True)
+        meta = {
+            "title": "Track",
+            "artists": "Artist",
+            "album": "Album",
+            "releaseDate": "2026",
+            "cover": "https://example.com/cover.jpg",
+        }
+
+        for _ in range(module._MAX_THUMBNAIL_THREADS + 5):
+            win.update_song_META(meta)
+
+        active = [
+            thread for thread in win._active_threads if isinstance(thread, module.DownloadThumbnail)
+        ]
+        assert len(active) == module._MAX_THUMBNAIL_THREADS
+
     def test_frameless_drag_handlers(self, qapp):
         """The custom window drag uses Qt.MouseButton enums and
         globalPosition().toPoint() (renamed from globalPos() in qt6). A synthetic
@@ -2854,17 +3141,12 @@ class TestTrackNumberMetadata:
         scraper._download_one_track(self._track(), str(tmp_path), "", track_num=7)
         assert captured[0]["trackNumber"] == 7
 
-    def test_writingmetatagsthread_writes_tracknumber(self, tmp_path, mocker):
+    def test_writingmetatagsthread_writes_tracknumber(self, tmp_path):
         """WritingMetaTagsThread writes trackNumber to ID3 when present."""
         from Spotify_Downloader import WritingMetaTagsThread
 
         # Mock EasyID3/ID3 so we can inspect what was written without a real mp3
-        mock_easy = mocker.MagicMock()
-        mocker.patch("Spotify_Downloader.EasyID3", return_value=mock_easy)
-        mocker.patch(
-            "Spotify_Downloader.requests.get",
-            return_value=mocker.MagicMock(status_code=200, content=b""),
-        )
+        mock_easy = MagicMock()
 
         tags = {
             "title": "T",
@@ -2876,19 +3158,15 @@ class TestTrackNumberMetadata:
         }
         thread = WritingMetaTagsThread(tags, str(tmp_path / "fake.mp3"))
         thread.tags_success = MagicMock()
-        thread.run()
+        with patch("Spotify_Downloader.EasyID3", return_value=mock_easy):
+            thread.run()
         mock_easy.__setitem__.assert_any_call("tracknumber", "5")
 
-    def test_writingmetatagsthread_skips_tracknumber_when_zero(self, tmp_path, mocker):
+    def test_writingmetatagsthread_skips_tracknumber_when_zero(self, tmp_path):
         """trackNumber=0 (unset) should not write a tag."""
         from Spotify_Downloader import WritingMetaTagsThread
 
-        mock_easy = mocker.MagicMock()
-        mocker.patch("Spotify_Downloader.EasyID3", return_value=mock_easy)
-        mocker.patch(
-            "Spotify_Downloader.requests.get",
-            return_value=mocker.MagicMock(status_code=200, content=b""),
-        )
+        mock_easy = MagicMock()
 
         tags = {
             "title": "T",
@@ -2900,7 +3178,8 @@ class TestTrackNumberMetadata:
         }
         thread = WritingMetaTagsThread(tags, str(tmp_path / "fake.mp3"))
         thread.tags_success = MagicMock()
-        thread.run()
+        with patch("Spotify_Downloader.EasyID3", return_value=mock_easy):
+            thread.run()
         # Confirm tracknumber was NOT written
         calls = [c for c in mock_easy.__setitem__.call_args_list if c.args[0] == "tracknumber"]
         assert len(calls) == 0
@@ -3342,6 +3621,70 @@ class TestSampleRateOption:
         assert MusicScraper(sample_rate=None).sample_rate == "auto"
 
 
+class TestOutputFilenameExtension:
+    """The configured container must drive reservation, resume, and manifests."""
+
+    @staticmethod
+    def _track():
+        from spotifydown_api import TrackInfo
+
+        return TrackInfo(
+            id="flac-track",
+            title="Title",
+            artists="Artist",
+            album=None,
+            release_date=None,
+            cover_url=None,
+            duration_ms=None,
+            preview_url=None,
+            raw={},
+        )
+
+    @staticmethod
+    def _stub_signals(scraper):
+        for signal in (
+            "song_meta",
+            "add_song_meta",
+            "dlprogress_signal",
+            "error_signal",
+            "count_updated",
+        ):
+            setattr(scraper, signal, MagicMock())
+
+    def test_all_formats_compose_their_real_extension(self):
+        from Spotify_Downloader import SUPPORTED_FORMATS, MusicScraper
+
+        for audio_format, spec in SUPPORTED_FORMATS.items():
+            scraper = MusicScraper(audio_format=audio_format)
+            assert scraper._compose_filename("Title", "Artist").endswith(f".{spec['ext']}")
+
+    def test_flac_manifest_resumes_against_flac_file(self, tmp_path):
+        from Spotify_Downloader import MusicScraper
+
+        first = MusicScraper(audio_format="flac")
+        self._stub_signals(first)
+        first._load_manifest(str(tmp_path))
+        first.download_track_audio = MagicMock(
+            side_effect=lambda _query, destination, **_kwargs: (
+                Path(destination).touch() or destination
+            )
+        )
+
+        assert first._download_one_track(self._track(), str(tmp_path), "") is None
+        destination = first.download_track_audio.call_args.args[1]
+        assert destination.endswith(".flac")
+
+        second = MusicScraper(audio_format="flac")
+        self._stub_signals(second)
+        assert second._load_manifest(str(tmp_path)) == {"flac-track"}
+        second.download_track_audio = MagicMock(
+            side_effect=AssertionError("resume downloaded again")
+        )
+
+        assert second._download_one_track(self._track(), str(tmp_path), "") is None
+        second.download_track_audio.assert_not_called()
+
+
 class TestTitleOnlyFilename:
     """Tests for the title_only filename option (#91): title-alone stems,
     interplay with the other naming settings, and the collision guards that
@@ -3438,6 +3781,61 @@ class TestTitleOnlyFilename:
         scraper._in_flight_files.add(os.path.join(str(tmp_path), "Title.mp3").casefold())
         captured = self._run(scraper, tmp_path, track=self._track("t2"))
         assert os.path.basename(captured[0]) == "Title [t2].mp3"
+
+    def test_signal_error_releases_filename_claim(self, tmp_path):
+        from Spotify_Downloader import MusicScraper
+
+        scraper = MusicScraper(title_only=True)
+        self._stub(scraper)
+        scraper.song_meta.emit.side_effect = RuntimeError("receiver failed")
+
+        with pytest.raises(RuntimeError, match="receiver failed"):
+            scraper._download_one_track(self._track("t2"), str(tmp_path), "")
+
+        assert scraper._in_flight_files == set()
+
+    def test_already_suffixed_inflight_collision_keeps_incrementing(self, tmp_path):
+        from Spotify_Downloader import MusicScraper
+
+        scraper = MusicScraper(title_only=True)
+        for filename in ("Title.mp3", "Title [t2].mp3"):
+            scraper._in_flight_files.add(os.path.join(str(tmp_path), filename).casefold())
+
+        captured = self._run(scraper, tmp_path, track=self._track("t2"))
+        assert os.path.basename(captured[0]) == "Title [t2-2].mp3"
+
+    def test_long_collision_name_keeps_disambiguator(self, tmp_path):
+        from Spotify_Downloader import MusicScraper
+
+        scraper = MusicScraper(title_only=True)
+        long_title = "夜" * 300
+        primary = scraper._compose_filename(long_title, "Artist")
+        scraper._in_flight_files.add(os.path.join(str(tmp_path), primary).casefold())
+
+        captured = self._run(
+            scraper,
+            tmp_path,
+            track=self._track("t2", title=long_title),
+        )
+        name = os.path.basename(captured[0])
+        assert len(name.encode("utf-8")) <= 250
+        assert name.endswith(" [t2].mp3")
+
+    def test_pathological_long_id_cannot_repeat_a_reserved_suffix(self, tmp_path):
+        from Spotify_Downloader import MusicScraper
+
+        scraper = MusicScraper(title_only=True)
+        long_id = "same-prefix-" + ("x" * 300)
+        reserved = set()
+        for disambig in (None, long_id):
+            filename = scraper._compose_filename("Title", "Artist", disambig=disambig)
+            claim = os.path.join(str(tmp_path), filename).casefold()
+            reserved.add(claim)
+            scraper._in_flight_files.add(claim)
+
+        captured = self._run(scraper, tmp_path, track=self._track(long_id))
+        assert len(captured) == 1
+        assert captured[0].casefold() not in reserved
 
     def test_inflight_collision_is_case_insensitive(self, tmp_path):
         """'Home' and 'home' are distinct strings but the same file on
@@ -3577,6 +3975,7 @@ class TestRetryPlayerClients:
         with contextlib.suppress(Exception):
             scraper.download_track_audio("q", "/tmp/never-written.mp3")
         assert captured, "expected at least one yt-dlp invocation"
+        assert len(captured) == 1
         assert not any("extractor_args" in o for o in captured)
 
     def test_retry_attempt_passes_the_client_set_through(self, monkeypatch):
@@ -3717,6 +4116,13 @@ class TestNetworkBlockNotice:
         )
         s._note_if_network_blocked("ERROR: Video unavailable")
         s._note_if_network_blocked("")
+        assert s.error_signal.emit.call_count == 0
+        assert s._network_blocked is False
+
+    def test_age_confirmation_does_not_block_the_whole_network(self):
+        s = self._scraper()
+        s._note_if_network_blocked("Sign in to confirm your age")
+
         assert s.error_signal.emit.call_count == 0
         assert s._network_blocked is False
 
@@ -3937,6 +4343,7 @@ class TestLogging:
                 for h in [h for h in S.log.handlers if getattr(h, "_sunnify", False)]:
                     h.close()
                     S.log.removeHandler(h)
+                S._close_crash_log()
 
     @staticmethod
     def _teardown_logging(S, prev_hook=None, prev_thook=None):
@@ -3947,6 +4354,7 @@ class TestLogging:
         for h in [h for h in S.log.handlers if getattr(h, "_sunnify", False)]:
             h.close()
             S.log.removeHandler(h)
+        S._close_crash_log()
 
     def test_crash_handlers_are_installed(self, tmp_path):
         import faulthandler
@@ -3961,6 +4369,8 @@ class TestLogging:
                 assert threading.excepthook is S._thread_excepthook
                 assert faulthandler.is_enabled()
                 assert (tmp_path / "crash.log").exists()  # sibling of sunnify.log
+                assert S._crash_log_handle is not None
+                assert not S._crash_log_handle.closed
             finally:
                 self._teardown_logging(S, prev_hook, prev_thook)
 
@@ -4387,3 +4797,39 @@ class TestStarPrompt:
         QTest.keyClick(dlg, Qt.Key.Key_Escape)
         assert dlg.result() == QDialog.DialogCode.Rejected
         assert not dlg.isVisible()
+
+
+class TestAtomicConfigPersistence:
+    def test_failed_replace_preserves_previous_config_and_cleans_temp(self, tmp_path):
+        import Spotify_Downloader as module
+
+        config_path = tmp_path / "config.json"
+        with patch.object(module, "_config_path", return_value=str(config_path)):
+            module.save_config({"format": "mp3"})
+            before = config_path.read_bytes()
+            with patch.object(module.os, "replace", side_effect=OSError("disk full")):
+                module.save_config({"format": "flac"})
+
+        assert config_path.read_bytes() == before
+        assert list(tmp_path.glob(".config-*.tmp")) == []
+
+    def test_parallel_saves_always_leave_valid_json(self, tmp_path):
+        import concurrent.futures
+        import json
+
+        import Spotify_Downloader as module
+
+        config_path = tmp_path / "config.json"
+
+        def save(index):
+            module.save_config({"version": 1, "writer": index})
+
+        with (
+            patch.object(module, "_config_path", return_value=str(config_path)),
+            concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor,
+        ):
+            list(executor.map(save, range(40)))
+
+        data = json.loads(config_path.read_text(encoding="utf-8"))
+        assert data["writer"] in range(40)
+        assert list(tmp_path.glob(".config-*.tmp")) == []

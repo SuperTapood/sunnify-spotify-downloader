@@ -10,7 +10,9 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-FLASK_AVAILABLE = importlib.util.find_spec("flask") is not None
+FLASK_AVAILABLE = all(
+    importlib.util.find_spec(module) is not None for module in ("flask", "flask_cors")
+)
 
 # Add backend directory for imports
 ROOT = Path(__file__).resolve().parent.parent
@@ -95,6 +97,21 @@ class TestScrapePlaylistEndpoint:
         )
         assert response.status_code == 400
 
+    @pytest.mark.parametrize("payload", [None, [], "not-an-object", {"playlistUrl": 123}])
+    def test_invalid_json_shape_returns_400(self, client, payload):
+        response = client.post("/api/scrape-playlist", json=payload)
+
+        assert response.status_code == 400
+        assert response.get_json()["event"] == "error"
+
+    def test_oversized_body_is_rejected(self, client):
+        response = client.post(
+            "/api/scrape-playlist",
+            json={"playlistUrl": "x" * (17 * 1024)},
+        )
+
+        assert response.status_code == 413
+
     def test_invalid_url_returns_400(self, client):
         """Invalid Spotify URL should return 400."""
         response = client.post(
@@ -143,12 +160,11 @@ class TestScrapePlaylistEndpoint:
         assert len(data["data"]["tracks"]) == 1
         assert data["data"]["tracks"][0]["title"] == "Test Song"
 
-    @patch("app.SpotifyEmbedAPI")
-    def test_valid_track_url(self, mock_api_class, client):
-        """Valid track URL should return single track data."""
-        # Create mock API instance
-        mock_api = MagicMock()
-        mock_api_class.return_value = mock_api
+    @patch("app.get_playlist_client")
+    def test_valid_track_url(self, mock_get_client, client):
+        """Single tracks reuse the shared client instead of opening a new session."""
+        mock_client = MagicMock()
+        mock_get_client.return_value = mock_client
 
         # Mock track data
         mock_track = MagicMock()
@@ -158,7 +174,7 @@ class TestScrapePlaylistEndpoint:
         mock_track.album = "Solo Album"
         mock_track.cover_url = "https://example.com/track-cover.jpg"
         mock_track.release_date = "2024-06-15"
-        mock_api.get_track.return_value = mock_track
+        mock_client.get_track.return_value = mock_track
 
         response = client.post(
             "/api/scrape-playlist",
@@ -171,6 +187,27 @@ class TestScrapePlaylistEndpoint:
         assert data["event"] == "complete"
         assert len(data["data"]["tracks"]) == 1
         assert data["data"]["tracks"][0]["title"] == "Single Track"
+        mock_get_client.assert_called_once_with()
+        mock_client.get_track.assert_called_once_with("xyz789")
+        mock_client.get_playlist_metadata.assert_not_called()
+        mock_client.iter_playlist_tracks.assert_not_called()
+
+    @patch("app.get_playlist_client")
+    def test_upstream_value_error_returns_sanitized_500(self, mock_get_client, client):
+        mock_get_playlist_client = MagicMock()
+        mock_get_playlist_client.get_track.side_effect = ValueError("private parser detail")
+        mock_get_client.return_value = mock_get_playlist_client
+
+        response = client.post(
+            "/api/scrape-playlist",
+            json={"playlistUrl": "https://open.spotify.com/track/xyz789"},
+        )
+
+        assert response.status_code == 500
+        assert response.get_json() == {
+            "event": "error",
+            "data": {"message": "Internal server error"},
+        }
 
 
 class TestCORS:
@@ -178,16 +215,24 @@ class TestCORS:
 
     def test_cors_headers_present(self, client):
         """CORS headers should be present on responses."""
-        response = client.get("/api/health")
-        # Flask-CORS adds these headers
-        # The exact headers depend on the request origin
+        response = client.get(
+            "/api/health",
+            headers={"Origin": "http://localhost:3000"},
+        )
+
         assert response.status_code == 200
+        assert response.headers["Access-Control-Allow-Origin"] == "http://localhost:3000"
 
     def test_options_preflight(self, client):
         """OPTIONS preflight request should work."""
         response = client.options(
             "/api/scrape-playlist",
-            headers={"Origin": "http://localhost:3000"},
+            headers={
+                "Origin": "http://localhost:3000",
+                "Access-Control-Request-Method": "POST",
+            },
         )
-        # Should not error
+
         assert response.status_code in (200, 204)
+        assert response.headers["Access-Control-Allow-Origin"] == "http://localhost:3000"
+        assert "POST" in response.headers["Access-Control-Allow-Methods"]

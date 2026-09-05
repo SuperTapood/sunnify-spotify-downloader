@@ -23,6 +23,7 @@ import atexit
 import concurrent.futures
 import contextlib
 import faulthandler
+import hashlib
 import logging
 import os
 import platform
@@ -32,6 +33,7 @@ import sys
 import threading
 import unicodedata
 import webbrowser
+from collections import OrderedDict
 from logging.handlers import RotatingFileHandler
 
 import requests
@@ -83,6 +85,10 @@ from Template import Ui_MainWindow
 # startup, so importing this module in tests stays silent and writes nothing.
 log = logging.getLogger("sunnify")
 
+_crash_log_handle = None
+_diagnostics_lock = threading.Lock()
+_diagnostics_exit_registered = False
+
 
 def _log_excepthook(exc_type, exc, tb):
     """Route uncaught main-thread exceptions to the log before the default handler."""
@@ -106,16 +112,50 @@ def _thread_excepthook(args):
         )
 
 
+def _close_crash_log() -> None:
+    """Disable faulthandler and close the file object backing its descriptor."""
+    global _crash_log_handle
+    with _diagnostics_lock:
+        handle, _crash_log_handle = _crash_log_handle, None
+        if handle is None:
+            return
+        with contextlib.suppress(Exception):
+            faulthandler.disable()
+        with contextlib.suppress(Exception):
+            handle.close()
+
+
+def _shutdown_diagnostics() -> None:
+    """Flush the final session marker before releasing crash diagnostics."""
+    with contextlib.suppress(Exception):
+        log.info("==== sunnify session end ====")
+    _close_crash_log()
+
+
 def _install_crash_handlers() -> None:
     """Make every abnormal exit land in the log; logging is our only diagnostic."""
+    global _crash_log_handle, _diagnostics_exit_registered
     sys.excepthook = _log_excepthook
     threading.excepthook = _thread_excepthook
     # faulthandler catches native crashes (qt/ffmpeg segfaults) excepthook can't;
-    # crash.log sits next to sunnify.log and stays open for the process lifetime.
+    # crash.log sits next to sunnify.log. Keep the Python file object alive:
+    # faulthandler retains only its descriptor, so a temporary open(...) object
+    # would be closed immediately and native-crash diagnostics would be lost.
     with contextlib.suppress(Exception):
         crash_path = os.path.join(os.path.dirname(log_file_path()), "crash.log")
-        faulthandler.enable(open(crash_path, "a"))  # noqa: SIM115
-    atexit.register(lambda: log.info("==== sunnify session end ===="))
+        with _diagnostics_lock:
+            current_path = getattr(_crash_log_handle, "name", None)
+            if _crash_log_handle is None or _crash_log_handle.closed or current_path != crash_path:
+                if _crash_log_handle is not None:
+                    with contextlib.suppress(Exception):
+                        faulthandler.disable()
+                    with contextlib.suppress(Exception):
+                        _crash_log_handle.close()
+                _crash_log_handle = open(crash_path, "a", encoding="utf-8")  # noqa: SIM115
+                faulthandler.enable(_crash_log_handle)
+            if not _diagnostics_exit_registered:
+                atexit.register(_shutdown_diagnostics)
+                _diagnostics_exit_registered = True
 
 
 class _YtdlpLog:
@@ -292,6 +332,47 @@ def scraper_kwargs_from(settings: dict) -> dict:
 MANIFEST_FILENAME = ".sunnify-manifest.jsonl"
 
 
+def _iter_manifest_records(path: str):
+    """Yield validated ``{"id", "file"}`` records from a resume manifest.
+
+    A power loss can leave a partial final line, and users may inspect/edit the
+    JSONL manually. Semantically invalid JSON (a list, scalar, non-string path,
+    or path traversal) is ignored just like syntactically invalid JSON instead
+    of crashing resume/status or reading outside the playlist directory.
+    """
+    import json
+    import ntpath
+
+    try:
+        with open(path, encoding="utf-8") as handle:
+            for line in handle:
+                try:
+                    record = json.loads(line)
+                except (TypeError, ValueError):
+                    continue
+                if not isinstance(record, dict):
+                    continue
+                track_id = record.get("id")
+                filename = record.get("file")
+                if not isinstance(track_id, str) or not track_id:
+                    continue
+                if not isinstance(filename, str) or not filename:
+                    continue
+                if (
+                    filename in (".", "..")
+                    or filename != os.path.basename(filename)
+                    or os.path.isabs(filename)
+                    or ntpath.splitdrive(filename)[0]
+                    or "/" in filename
+                    or "\\" in filename
+                    or any(ord(char) < 32 for char in filename)
+                ):
+                    continue
+                yield {"id": track_id, "file": filename}
+    except OSError:
+        return
+
+
 def _config_dir() -> str:
     """Return the per-user config directory, creating it if needed."""
     import json as _json  # noqa: F401 (used by load/save)
@@ -321,7 +402,9 @@ def _log_dir() -> str:
       linux   -> $XDG_STATE_HOME/sunnify/logs (defaults to ~/.local/state)
     """
     if sys.platform == "win32":
-        base = os.environ.get("LOCALAPPDATA") or os.environ.get("APPDATA", os.path.expanduser("~"))
+        base = (
+            os.environ.get("LOCALAPPDATA") or os.environ.get("APPDATA") or os.path.expanduser("~")
+        )
         path = os.path.join(base, "Sunnify", "logs")
     elif sys.platform == "darwin":
         path = os.path.join(os.path.expanduser("~"), "Library", "Logs", "Sunnify")
@@ -355,7 +438,7 @@ def setup_logging() -> str:
     handler = RotatingFileHandler(
         path, maxBytes=1_000_000, backupCount=5, encoding="utf-8", delay=True
     )
-    handler._sunnify = True  # tag so we don't double-attach on re-call
+    handler.__dict__["_sunnify"] = True  # tag so we don't double-attach on re-call
     handler.setFormatter(
         logging.Formatter(
             "%(asctime)s %(levelname)-7s [%(funcName)s:%(lineno)d] %(message)s",
@@ -417,14 +500,34 @@ def load_config() -> dict:
 
 
 def save_config(config: dict) -> None:
-    """Persist user config to disk. Best-effort, swallows IO errors."""
+    """Persist user config atomically. Best-effort, swallowing I/O errors."""
     import json
+    import tempfile
 
+    temp_path = None
+    fd = None
     try:
-        with open(_config_path(), "w", encoding="utf-8") as f:
+        destination = _config_path()
+        fd, temp_path = tempfile.mkstemp(
+            prefix=".config-", suffix=".tmp", dir=os.path.dirname(destination)
+        )
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
+            fd = None
             json.dump(config, f, indent=2)
+            f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temp_path, destination)
+        temp_path = None
     except OSError as exc:
         log.warning("could not save config: %s", exc)
+    finally:
+        if fd is not None:
+            with contextlib.suppress(OSError):
+                os.close(fd)
+        if temp_path:
+            with contextlib.suppress(OSError):
+                os.remove(temp_path)
 
 
 GITHUB_REPO = "sunnypatell/sunnify-spotify-downloader"
@@ -557,6 +660,7 @@ class MusicScraper(QThread):
         title_only: bool = False,
         sample_rate: str = "auto",
         loose_match: bool = False,
+        write_metadata: bool = False,
     ):
         super().__init__()
         self.counter = 0  # Initialize counter to zero
@@ -576,12 +680,18 @@ class MusicScraper(QThread):
         # duration-closest youtube result (recovers cross-script matches);
         # off by default so the wrong-audio safeguard (#52) stays the default.
         self.loose_match = bool(loose_match)
+        # GUI downloads opt in from the "Add Meta Tags" checkbox; the CLI
+        # enables this unconditionally. Writing inside the bounded download
+        # workers guarantees completion before a run is reported finished.
+        self.write_metadata = bool(write_metadata)
         self._counter_lock = threading.Lock()
         self._failed_lock = threading.Lock()
         self._filename_lock = threading.Lock()
         self._manifest_lock = threading.Lock()
         self._manifest_path: str | None = None
         self._manifest_owners: dict[str, str] = {}
+        self._manifest_records: set[tuple[str, str]] = set()
+        self._manifest_write_warned = False
         # youtube blocks per-IP, so it hits every track at once; say it once
         # rather than 300 times, and say what it actually means
         self._network_blocked = False
@@ -596,7 +706,7 @@ class MusicScraper(QThread):
         """Check if cancellation has been requested."""
         return self._cancel_event.is_set()
 
-    _BLOCK_MARKERS = ("sign in to confirm", "not a bot", "confirm you're not a bot")
+    _BLOCK_MARKERS = ("not a bot", "bot check", "bot challenge")
 
     def _note_if_network_blocked(self, reason: str) -> None:
         """Emit one plain-language notice the first time YouTube gates us.
@@ -643,8 +753,33 @@ class MusicScraper(QThread):
 
     def ensure_spotifydown_api(self):
         if self.spotifydown_api is None:
-            self.spotifydown_api = PlaylistClient(session=self.session)
+            # PlaylistClient owns thread-local connection pools. Passing this
+            # scraper's legacy Session would force four enrichment workers to
+            # share one requests.Session, which is not thread-safe.
+            self.spotifydown_api = PlaylistClient()
         return self.spotifydown_api
+
+    def close(self) -> None:
+        """Release HTTP connection pools owned by this scraper."""
+        client, self.spotifydown_api = self.spotifydown_api, None
+        if client is not None and hasattr(client, "close"):
+            with contextlib.suppress(Exception):
+                client.close()
+        with contextlib.suppress(Exception):
+            self.session.close()
+
+    def _youtube_is_blocked(self) -> bool:
+        with self._failed_lock:
+            return self._network_blocked
+
+    def _write_metadata_if_enabled(self, song_meta: dict) -> None:
+        if not self.write_metadata:
+            return
+        try:
+            song_meta["_metadata_status"] = _write_song_metadata(song_meta, song_meta["file"])
+        except Exception:
+            log.error("tag write failed: %s", song_meta.get("file", "?"), exc_info=True)
+            song_meta["_metadata_status"] = "Tagging failed (audio was downloaded)"
 
     def sanitize_text(self, text):
         """Sanitize text for filename usage."""
@@ -661,11 +796,22 @@ class MusicScraper(QThread):
             stem = f"{sanitized_artists} - {sanitized_title}"
         else:
             stem = f"{sanitized_title} - {sanitized_artists}"
+        preserved_suffix = ""
         if disambig:
-            stem = f"{stem} [{disambig}]"
+            safe_disambig = sanitize_filename(str(disambig), allow_spaces=False)
+            if len(safe_disambig.encode("utf-8")) > 64:
+                # Remote ids are normally 22 ASCII characters. Hash a
+                # pathological/custom id so numbered collision attempts stay
+                # distinct instead of all truncating to the same 64-byte prefix.
+                safe_disambig = hashlib.sha256(safe_disambig.encode("utf-8")).hexdigest()[:20]
+            preserved_suffix = f" [{safe_disambig}]"
+            stem = f"{stem}{preserved_suffix}"
+        extension = SUPPORTED_FORMATS[self.audio_format]["ext"]
         if self.include_track_number and track_num is not None:
-            return f"{track_num:02d}. {stem}.mp3"
-        return f"{stem}.mp3"
+            filename = f"{track_num:02d}. {stem}.{extension}"
+        else:
+            filename = f"{stem}.{extension}"
+        return cap_filename(filename, preserve_stem_suffix=preserved_suffix)
 
     def format_playlist_name(self, metadata: PlaylistInfo):
         owner = metadata.owner or "Spotify"
@@ -793,11 +939,7 @@ class MusicScraper(QThread):
         # Spotify spells release editions as ``Title - Video Edit`` while
         # YouTube's exact catalog title commonly uses parentheses.
         head, separator, suffix = str(expected_title).rpartition(" - ")
-        if (
-            separator
-            and cls._SPOTIFY_VARIANT_SUFFIX_RE.fullmatch(suffix.strip())
-            and head.strip()
-        ):
+        if separator and cls._SPOTIFY_VARIANT_SUFFIX_RE.fullmatch(suffix.strip()) and head.strip():
             edition = cls._quote_youtube_search_term(f"{head.strip()} ({suffix.strip()})")
             add(f"{edition} {artist}")
 
@@ -916,16 +1058,14 @@ class MusicScraper(QThread):
     @staticmethod
     def _has_latin_letters(value: str) -> bool:
         return any(
-            unicodedata.category(char).startswith("L")
-            and "LATIN" in unicodedata.name(char, "")
+            unicodedata.category(char).startswith("L") and "LATIN" in unicodedata.name(char, "")
             for char in value
         )
 
     @classmethod
     def _has_non_latin_letters(cls, value: str) -> bool:
         return any(
-            unicodedata.category(char).startswith("L")
-            and "LATIN" not in unicodedata.name(char, "")
+            unicodedata.category(char).startswith("L") and "LATIN" not in unicodedata.name(char, "")
             for char in value
         )
 
@@ -960,9 +1100,7 @@ class MusicScraper(QThread):
             "version",
             "video",
         )
-        return any(
-            cls._contains_token_sequence(normalized, phrase) for phrase in qualifier_phrases
-        )
+        return any(cls._contains_token_sequence(normalized, phrase) for phrase in qualifier_phrases)
 
     @classmethod
     def _spotify_title_targets(cls, title: str | None) -> list[str]:
@@ -1059,8 +1197,7 @@ class MusicScraper(QThread):
     def _candidate_attribution_matches_any_artist(cls, candidate, artist_tokens) -> bool:
         """Match artists only against channel/uploader attribution fields."""
         attribution_fields = [
-            cls._normalize_title(candidate.get(field) or "")
-            for field in ("channel", "uploader")
+            cls._normalize_title(candidate.get(field) or "") for field in ("channel", "uploader")
         ]
         compact_suffixes = ("official", "music", "topic", "vevo")
 
@@ -1190,8 +1327,7 @@ class MusicScraper(QThread):
         else:
             values.extend(tags)
         return any(
-            value and cls._title_plausibly_matches(str(value), expected_title)
-            for value in values
+            value and cls._title_plausibly_matches(str(value), expected_title) for value in values
         )
 
     @classmethod
@@ -1387,6 +1523,8 @@ class MusicScraper(QThread):
         )
 
         def fetch_entries(query):
+            if self.is_cancelled() or self._youtube_is_blocked():
+                return None
             try:
                 with YoutubeDL(select_opts) as ydl:
                     info = ydl.extract_info(query, download=False)
@@ -1399,6 +1537,7 @@ class MusicScraper(QThread):
                     query,
                     str(exc)[:300],
                 )
+                self._note_if_network_blocked(str(exc))
                 return None
             found = [e for e in (info or {}).get("entries", []) if e and e.get("id")]
             log.debug("yt search returned %d entries for %r", len(found), query)
@@ -1408,6 +1547,8 @@ class MusicScraper(QThread):
 
         def hydrate_entry(entry):
             """Fetch fields omitted by ``extract_flat`` for one candidate."""
+            if self.is_cancelled() or self._youtube_is_blocked():
+                return None
             entry_id = entry.get("id")
             if entry_id in hydrated_cache:
                 return hydrated_cache[entry_id]
@@ -1425,6 +1566,7 @@ class MusicScraper(QThread):
                     entry["id"],
                     str(exc)[:200],
                 )
+                self._note_if_network_blocked(str(exc))
                 hydrated_cache[entry_id] = None
                 return None
             if not hydrated:
@@ -1550,12 +1692,8 @@ class MusicScraper(QThread):
                     album_exact = bool(
                         normalized_expected_album and album == normalized_expected_album
                     )
-                    artist_match = self._metadata_matches_any_artist(
-                        hydrated, artist_tokens
-                    )
-                    metadata_title = self._metadata_title_matches(
-                        hydrated, expected_title
-                    )
+                    artist_match = self._metadata_matches_any_artist(hydrated, artist_tokens)
+                    metadata_title = self._metadata_title_matches(hydrated, expected_title)
 
                     # A declared canonical alias is strong, but when Spotify
                     # supplied an album it must identify the same release.
@@ -1571,9 +1709,7 @@ class MusicScraper(QThread):
                     if not allow_cross_script or delta > 4:
                         continue
                     track_title = (
-                        hydrated.get("track")
-                        or hydrated.get("alt_title")
-                        or hydrated.get("title")
+                        hydrated.get("track") or hydrated.get("alt_title") or hydrated.get("title")
                     )
                     track_normalized = self._normalize_title(track_title)
                     if not self._opposite_script_titles(expected_title, track_title):
@@ -1595,9 +1731,7 @@ class MusicScraper(QThread):
                     else:
                         artist_ok = (
                             track_normalized in trusted_aliases
-                            and self._structured_metadata_artist_matches(
-                                hydrated, artist_tokens
-                            )
+                            and self._structured_metadata_artist_matches(hydrated, artist_tokens)
                         )
                     if artist_ok:
                         cross_script_aliases.append((hydrated, album_exact))
@@ -1605,9 +1739,7 @@ class MusicScraper(QThread):
                 qualified = exact_aliases
                 if not qualified and cross_script_aliases:
                     exact_album_matches = [
-                        candidate
-                        for candidate, album_exact in cross_script_aliases
-                        if album_exact
+                        candidate for candidate, album_exact in cross_script_aliases if album_exact
                     ]
                     qualified = exact_album_matches or [
                         candidate for candidate, _ in cross_script_aliases
@@ -1642,9 +1774,7 @@ class MusicScraper(QThread):
                 aliases = []
                 for group in entry_groups:
                     for entry in group or []:
-                        if not self._candidate_attribution_matches_any_artist(
-                            entry, artist_tokens
-                        ):
+                        if not self._candidate_attribution_matches_any_artist(entry, artist_tokens):
                             continue
                         candidate = entry
                         if candidate.get("channel_is_verified") is not True:
@@ -1919,6 +2049,13 @@ class MusicScraper(QThread):
             "ignoreerrors": True,
             "postprocessors": [postprocessor],
         }
+
+        def stop_if_cancelled(_status):
+            if self.is_cancelled():
+                raise InterruptedError("download cancelled")
+
+        ydl_opts["progress_hooks"] = [stop_if_cancelled]
+        ydl_opts["postprocessor_hooks"] = [stop_if_cancelled]
         if self.sample_rate != "auto" and fmt in ("mp3", "flac", "wav"):
             # "extractaudio" is the only key yt-dlp matches for this PP.
             # opus excluded (libopus is 48 kHz-only); m4a excluded (may
@@ -1937,13 +2074,19 @@ class MusicScraper(QThread):
         # yt-dlp's maintained defaults first, then a different client family:
         # youtube bot-challenges per-IP and per-client, so a second family is
         # worth one retry. Never a pinned list - see _retry_player_clients.
-        fallback_opts = dict(ydl_opts)
+        attempts = [("default", ydl_opts)]
         retry_clients = _retry_player_clients()
         if retry_clients:
+            fallback_opts = dict(ydl_opts)
             fallback_opts["extractor_args"] = {"youtube": {"player_client": list(retry_clients)}}
-        attempts = [("default", ydl_opts), ("fallback", fallback_opts)]
+            attempts.append(("fallback", fallback_opts))
+        attempted_video_urls = set()
 
         for query in queries:
+            if self.is_cancelled():
+                raise InterruptedError("download cancelled")
+            if self._youtube_is_blocked():
+                raise RuntimeError("YouTube blocked this network with a bot check")
             video_url = self._select_youtube_match(
                 query,
                 expected_duration_s,
@@ -1951,9 +2094,14 @@ class MusicScraper(QThread):
                 expected_artists=expected_artists,
                 expected_album=expected_album,
             )
-            if not video_url:
+            if not video_url or video_url in attempted_video_urls:
                 continue
+            attempted_video_urls.add(video_url)
             for label, opts in attempts:
+                if self.is_cancelled():
+                    raise InterruptedError("download cancelled")
+                if self._youtube_is_blocked():
+                    raise RuntimeError("YouTube blocked this network with a bot check")
                 # per-attempt bridge captures yt-dlp's own error even when
                 # ignoreerrors swallows it (no exception, no file)
                 ytlog = _YtdlpLog()
@@ -1968,6 +2116,8 @@ class MusicScraper(QThread):
                         str(exc)[:300],
                     )
                     self._note_if_network_blocked(str(exc))
+                    if self.is_cancelled():
+                        raise InterruptedError("download cancelled") from exc
                 else:
                     if not os.path.exists(expected_path):
                         # the silent case: yt-dlp produced no file without
@@ -1989,20 +2139,20 @@ class MusicScraper(QThread):
         raise RuntimeError("no playable audio source found on YouTube for this track")
 
     def download_http_file(self, url, destination):
-        response = self.session.get(url, stream=True, timeout=60)
-        response.raise_for_status()
-        total = int(response.headers.get("content-length", 0))
-        downloaded = 0
-        os.makedirs(os.path.dirname(destination), exist_ok=True)
-        with open(destination, "wb") as handle:
-            for chunk in response.iter_content(chunk_size=8192):
-                if not chunk:
-                    continue
-                handle.write(chunk)
-                downloaded += len(chunk)
-                if total:
-                    progress = int(downloaded / total * 100)
-                    self.dlprogress_signal.emit(progress)
+        with self.session.get(url, stream=True, timeout=60) as response:
+            response.raise_for_status()
+            total = int(response.headers.get("content-length", 0))
+            downloaded = 0
+            os.makedirs(os.path.dirname(destination), exist_ok=True)
+            with open(destination, "wb") as handle:
+                for chunk in response.iter_content(chunk_size=8192):
+                    if not chunk:
+                        continue
+                    handle.write(chunk)
+                    downloaded += len(chunk)
+                    if total:
+                        progress = int(downloaded / total * 100)
+                        self.dlprogress_signal.emit(progress)
         return destination
 
     def _download_one_track(self, track, playlist_folder_path, default_cover_url, track_num=0):
@@ -2023,33 +2173,16 @@ class MusicScraper(QThread):
         if self.is_cancelled():
             return None
 
+        if self._youtube_is_blocked():
+            with self._failed_lock:
+                self._failed_tracks.append(track.title)
+            self._finish_track_ui(ok=False)
+            return track.title
+
         track_title = track.title
         artists = track.artists
         sanitized_title = self.sanitize_text(track_title)
         sanitized_artists = self.sanitize_text(artists)
-
-        filename = self._compose_filename(sanitized_title, sanitized_artists, track_num)
-        filepath = os.path.join(playlist_folder_path, cap_filename(filename))
-
-        # Collision guard: distinct tracks can resolve to the same name
-        # (always possible, likely under title_only), and parallel workers
-        # racing os.path.exists would clobber each other. Claim under a lock;
-        # if taken in-flight, on a case-folding filesystem, or on disk owned
-        # by a different track per the manifest, suffix the track id.
-        with self._filename_lock:
-            claim = filepath.casefold()
-            if claim in self._in_flight_files or self._file_belongs_to_other(filepath, track.id):
-                log.info(
-                    "filename collision: %r already claimed, suffixing track id %s",
-                    os.path.basename(filepath),
-                    track.id,
-                )
-                filename = self._compose_filename(
-                    sanitized_title, sanitized_artists, track_num, disambig=track.id
-                )
-                filepath = os.path.join(playlist_folder_path, cap_filename(filename))
-                claim = filepath.casefold()
-            self._in_flight_files.add(claim)
 
         # Per-track cover enrichment: the playlist embed has no per-track
         # cover urls (the "all 300 songs have the same cover" report), so
@@ -2078,6 +2211,40 @@ class MusicScraper(QThread):
 
         cover_url = cover_url or default_cover_url
 
+        # Collision guard: distinct tracks can resolve to the same name
+        # (always possible, likely under title_only), and parallel workers
+        # racing os.path.exists would clobber each other. Claim under a lock;
+        # if taken in-flight, on a case-folding filesystem, or on disk owned
+        # by a different track per the manifest, suffix the track id. Keep
+        # incrementing when the suffixed name is also in flight (duplicate
+        # playlist entries can otherwise make a third worker clobber the
+        # second worker's `[id]` file).
+        with self._filename_lock:
+            disambig = None
+            collision_index = 0
+            while True:
+                filename = self._compose_filename(
+                    sanitized_title, sanitized_artists, track_num, disambig=disambig
+                )
+                filepath = os.path.join(playlist_folder_path, cap_filename(filename))
+                claim = filepath.casefold()
+                if claim not in self._in_flight_files and not self._file_belongs_to_other(
+                    filepath, track.id
+                ):
+                    break
+                if disambig is None:
+                    log.info(
+                        "filename collision: %r already claimed, suffixing track id %s",
+                        os.path.basename(filepath),
+                        track.id,
+                    )
+                collision_index += 1
+                base_disambig = str(track.id or "duplicate")
+                disambig = (
+                    base_disambig if collision_index == 1 else f"{base_disambig}-{collision_index}"
+                )
+            self._in_flight_files.add(claim)
+
         song_meta = {
             "title": track_title,
             "artists": artists,
@@ -2088,12 +2255,13 @@ class MusicScraper(QThread):
             "trackNumber": track_num,
         }
 
-        # Preview panel shows whichever track most recently started; the
-        # worker race is fine (better than a blank panel).
-        self.song_meta.emit(dict(song_meta))
-
         try:
+            # Preview panel shows whichever track most recently started; the
+            # worker race is fine (better than a blank panel).
+            self.song_meta.emit(dict(song_meta))
+
             if os.path.exists(filepath):
+                self._write_metadata_if_enabled(song_meta)
                 self._record_in_manifest(track.id, filepath)
                 self.add_song_meta.emit(song_meta)
                 self._finish_track_ui(ok=True)
@@ -2111,6 +2279,8 @@ class MusicScraper(QThread):
                     expected_album=album_name,
                 )
             except Exception as error_status:
+                if self.is_cancelled():
+                    return None
                 error_msg = self._get_user_friendly_error(error_status, track_title)
                 self.error_signal.emit(error_msg)
                 # concise reason at WARNING (the per-attempt yt-dlp reason is
@@ -2133,8 +2303,9 @@ class MusicScraper(QThread):
                 self._finish_track_ui(ok=False)
                 return track_title
 
-            self._record_in_manifest(track.id, final_path)
             song_meta["file"] = final_path
+            self._write_metadata_if_enabled(song_meta)
+            self._record_in_manifest(track.id, final_path)
             self.add_song_meta.emit(song_meta)
             self._finish_track_ui(ok=True)
             return None
@@ -2144,12 +2315,12 @@ class MusicScraper(QThread):
 
     def _finish_track_ui(self, ok: bool) -> None:
         """Update counter + progress bar after a track completes or fails."""
-        self.increment_counter()
+        current = self.increment_counter()
         if self._parallel_mode and self._total_tracks > 0:
             # Aggregate progress across all workers: show how many tracks are
             # done as a percentage. Avoids the N-workers-jittering-one-bar
             # problem where per-byte emits from 4 downloads make the bar jump.
-            pct = int(self.counter / self._total_tracks * 100)
+            pct = int(current / self._total_tracks * 100)
             self.dlprogress_signal.emit(min(pct, 100))
         elif ok:
             self.dlprogress_signal.emit(100)
@@ -2158,35 +2329,27 @@ class MusicScraper(QThread):
         """Load the set of track IDs already downloaded into `folder`.
 
         The manifest is a JSON-lines file inside the folder; each line is a
-        `{"id", "file"}` record. Entries whose file is missing are ignored so
-        a track the user deleted re-downloads. Returns the set of valid IDs
-        and arms `_manifest_path` for incremental appends during this run.
+        `{"id", "file"}` record. Entries whose file is missing or belongs to
+        another output format are ignored, so deletions and format changes
+        download the requested audio. Returns the set of valid IDs and arms
+        `_manifest_path` for incremental appends during this run.
         """
-        import json
-
         path = os.path.join(folder, MANIFEST_FILENAME)
         self._manifest_path = path
         self._manifest_owners = {}
+        self._manifest_records = set()
+        self._manifest_write_warned = False
         done: set[str] = set()
-        if not os.path.exists(path):
-            return done
-        try:
-            with open(path, encoding="utf-8") as handle:
-                for line in handle:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        record = json.loads(line)
-                    except ValueError:
-                        continue
-                    track_id = record.get("id")
-                    filename = record.get("file")
-                    if track_id and filename and os.path.exists(os.path.join(folder, filename)):
-                        done.add(track_id)
-                        self._manifest_owners[filename.casefold()] = track_id
-        except OSError:
-            return set()
+        target_extension = f".{SUPPORTED_FORMATS[self.audio_format]['ext']}".casefold()
+        for record in _iter_manifest_records(path):
+            track_id = record["id"]
+            filename = record["file"]
+            if os.path.splitext(filename)[1].casefold() == target_extension and os.path.isfile(
+                os.path.join(folder, filename)
+            ):
+                done.add(track_id)
+                self._manifest_owners[filename.casefold()] = track_id
+                self._manifest_records.add((track_id, filename.casefold()))
         return done
 
     def _file_belongs_to_other(self, filepath: str, track_id) -> bool:
@@ -2210,16 +2373,25 @@ class MusicScraper(QThread):
             return
         import json
 
-        record = json.dumps({"id": track_id, "file": os.path.basename(filepath)})
+        filename = os.path.basename(filepath)
+        record_key = (str(track_id), filename.casefold())
+        record = json.dumps({"id": str(track_id), "file": filename})
+        # _file_belongs_to_other reads this map under _filename_lock while
+        # parallel workers claim paths; publish ownership under the same lock.
+        with self._filename_lock:
+            self._manifest_owners.setdefault(filename.casefold(), str(track_id))
         with self._manifest_lock:
-            # keep the ownership map live so a same-title track later in this
-            # run suffixes instead of mistaking the finished file for its own
-            self._manifest_owners.setdefault(os.path.basename(filepath).casefold(), track_id)
+            if record_key in self._manifest_records:
+                return
             try:
                 with open(self._manifest_path, "a", encoding="utf-8") as handle:
                     handle.write(record + "\n")
-            except OSError:
-                pass
+                    handle.flush()
+                self._manifest_records.add(record_key)
+            except OSError as exc:
+                if not self._manifest_write_warned:
+                    log.warning("could not update resume manifest: %s", exc)
+                    self._manifest_write_warned = True
 
     def scrape_playlist(self, spotify_playlist_link, music_folder):
         # Reset mutable state so repeat invocations on the same scraper
@@ -2228,6 +2400,7 @@ class MusicScraper(QThread):
             self.counter = 0
         with self._failed_lock:
             self._failed_tracks.clear()
+            self._network_blocked = False
         with self._filename_lock:
             self._in_flight_files.clear()
         self._parallel_mode = False
@@ -2267,32 +2440,41 @@ class MusicScraper(QThread):
                 f"Resuming: skipping {len(already_done)} already-downloaded track(s)"
             )
 
-        # Materialize the generator (not thread-safe; count also picks the
-        # worker pool size). Cancel is checked between yields so huge
-        # playlists abort mid-fetch instead of after the full window.
-        expected_total = metadata.track_count or 0
-        tracks: list = []
-        for track in spotify_api.iter_playlist_tracks(
+        # Spotify normally gives us an exact count. Use it to size the worker
+        # pool before consuming the track generator, allowing the first audio
+        # downloads to overlap metadata retrieval for the rest of a large
+        # playlist. If an alternate/mock provider has no trustworthy count,
+        # retain the safe materialized fallback.
+        raw_total = metadata.track_count
+        expected_total = (
+            raw_total if isinstance(raw_total, int) and not isinstance(raw_total, bool) else 0
+        )
+        expected_remaining = max(expected_total - len(already_done), 0)
+        track_iter = spotify_api.iter_playlist_tracks(
             playlist_id, content_type=content_type, skip_ids=already_done
-        ):
-            if self.is_cancelled():
-                break
-            tracks.append(track)
-            if expected_total and len(tracks) % 10 == 0:
-                self.error_signal.emit(
-                    f"Fetching track metadata ({len(tracks)} of {expected_total})..."
-                )
-        self._total_tracks = len(tracks)
+        )
+        if expected_total:
+            tracks = track_iter
+            planned_tracks = expected_remaining
+        else:
+            materialized = []
+            for track in track_iter:
+                if self.is_cancelled():
+                    break
+                materialized.append(track)
+            tracks = iter(materialized)
+            planned_tracks = len(materialized)
 
         if self.is_cancelled():
             self.PlaylistCompleted.emit("Download cancelled")
             return
 
+        self._total_tracks = planned_tracks
         self.Resetprogress_signal.emit(0)
 
         # Small playlists don't benefit from parallelism. Keep 1 worker for
         # playlists under 3 tracks to preserve the single-track UI feel.
-        worker_count = 1 if len(tracks) < 3 else min(self.MAX_WORKERS, len(tracks))
+        worker_count = 1 if planned_tracks < 3 else min(self.MAX_WORKERS, planned_tracks)
         self._parallel_mode = worker_count > 1
 
         log.info(
@@ -2300,7 +2482,7 @@ class MusicScraper(QThread):
             content_type,
             playlist_display_name,
             playlist_id,
-            len(tracks),
+            planned_tracks,
             len(already_done),
             "parallel" if self._parallel_mode else "sequential",
             worker_count,
@@ -2317,10 +2499,13 @@ class MusicScraper(QThread):
         def _track_num_for(track, idx):
             return track.position if getattr(track, "position", None) else idx
 
+        scheduled = 0
         if worker_count == 1:
             for idx, track in enumerate(tracks, start=1):
                 if self.is_cancelled():
                     break
+                scheduled = idx
+                self._total_tracks = max(self._total_tracks, scheduled)
                 # Reset the per-track progress bar at the top of each iteration
                 # so the single-track UI behaves the way it always has.
                 self.Resetprogress_signal.emit(0)
@@ -2333,16 +2518,27 @@ class MusicScraper(QThread):
         else:
             try:
                 with concurrent.futures.ThreadPoolExecutor(max_workers=worker_count) as executor:
-                    futures = [
-                        executor.submit(
-                            self._download_one_track,
-                            track,
-                            playlist_folder_path,
-                            metadata.cover_url,
-                            _track_num_for(track, idx),
+                    futures = []
+                    for idx, track in enumerate(tracks, start=1):
+                        if self.is_cancelled() or self._youtube_is_blocked():
+                            break
+                        scheduled = idx
+                        futures.append(
+                            executor.submit(
+                                self._download_one_track,
+                                track,
+                                playlist_folder_path,
+                                metadata.cover_url,
+                                _track_num_for(track, idx),
+                            )
                         )
-                        for idx, track in enumerate(tracks, start=1)
-                    ]
+                        if expected_total and scheduled % 10 == 0:
+                            self.error_signal.emit(
+                                f"Fetching track metadata ({scheduled} of {expected_remaining})..."
+                            )
+                    # Providers may omit unavailable rows despite advertising
+                    # a larger count. Final reporting uses what was scheduled.
+                    self._total_tracks = scheduled
                     for future in concurrent.futures.as_completed(futures):
                         if self.is_cancelled():
                             # Cancel remaining futures that haven't started
@@ -2362,6 +2558,8 @@ class MusicScraper(QThread):
                 # Reset only after executor shutdown: in-flight workers that
                 # observed False mid-run would emit single-track UI signals.
                 self._parallel_mode = False
+
+        self._total_tracks = scheduled
 
         if self.is_cancelled():
             log.info("scrape cancelled by user (%d done before cancel)", self.counter)
@@ -2433,6 +2631,7 @@ class MusicScraper(QThread):
         self.song_meta.emit(dict(song_meta))
 
         if os.path.exists(filepath):
+            self._write_metadata_if_enabled(song_meta)
             self.add_song_meta.emit(song_meta)
             self.increment_counter()
             self.PlaylistCompleted.emit("Track already exists!")
@@ -2468,16 +2667,18 @@ class MusicScraper(QThread):
             return
 
         song_meta["file"] = final_path
+        self._write_metadata_if_enabled(song_meta)
         self.add_song_meta.emit(song_meta)
         self.increment_counter()
         self.dlprogress_signal.emit(100)
         self.PlaylistCompleted.emit("Download Complete!")
 
-    def increment_counter(self):
+    def increment_counter(self) -> int:
         with self._counter_lock:
             self.counter += 1
             current = self.counter
         self.count_updated.emit(current)  # Emit the signal with the updated count
+        return current
 
 
 # Scraper Thread
@@ -2515,19 +2716,79 @@ class ScraperThread(QThread):
         except Exception as e:
             log.exception("scrape failed for %s", self.spotify_link)
             self.progress_update.emit(f"{e}")
+        finally:
+            self.scraper.close()
+
+
+_COVER_CACHE_ITEMS = 64
+_COVER_CACHE_BYTES = 32 * 1024 * 1024
+_MAX_THUMBNAIL_THREADS = 4
+_cover_cache: OrderedDict[str, bytes] = OrderedDict()
+_cover_cache_size = 0
+_cover_inflight: dict[str, threading.Event] = {}
+_cover_cache_lock = threading.Lock()
+
+
+def _clear_cover_cache() -> None:
+    """Clear the process-local artwork cache (primarily useful for tests)."""
+    global _cover_cache_size
+    with _cover_cache_lock:
+        _cover_cache.clear()
+        _cover_cache_size = 0
 
 
 def _fetch_cover_bytes(url: str) -> bytes | None:
-    """Download cover image bytes, returning None on any failure."""
+    """Download cover bytes once per URL, with a bounded single-flight LRU."""
+    global _cover_cache_size
     if not url:
         return None
+
+    with _cover_cache_lock:
+        cached = _cover_cache.pop(url, None)
+        if cached is not None:
+            _cover_cache[url] = cached
+            return cached
+        waiter = _cover_inflight.get(url)
+        if waiter is None:
+            waiter = threading.Event()
+            _cover_inflight[url] = waiter
+            leader = True
+        else:
+            leader = False
+
+    if not leader:
+        # The network timeout is 15s. A small margin prevents a stuck leader
+        # from pinning every tag/preview worker indefinitely.
+        waiter.wait(17)
+        with _cover_cache_lock:
+            return _cover_cache.get(url)
+
+    result = None
     try:
         resp = requests.get(url, timeout=15)
         if resp.status_code == 200 and resp.content:
-            return resp.content
+            result = bytes(resp.content)
     except (requests.RequestException, OSError) as exc:
         log.debug("cover fetch failed: %s", exc)
-    return None
+    finally:
+        with _cover_cache_lock:
+            # Oversized artwork is still returned to this caller but not held
+            # for the process lifetime. Spotify covers are normally far below
+            # this overall 32 MiB cache ceiling.
+            if result is not None and len(result) <= _COVER_CACHE_BYTES:
+                previous = _cover_cache.pop(url, None)
+                if previous is not None:
+                    _cover_cache_size -= len(previous)
+                _cover_cache[url] = result
+                _cover_cache_size += len(result)
+                while _cover_cache and (
+                    len(_cover_cache) > _COVER_CACHE_ITEMS or _cover_cache_size > _COVER_CACHE_BYTES
+                ):
+                    _, evicted = _cover_cache.popitem(last=False)
+                    _cover_cache_size -= len(evicted)
+            _cover_inflight.pop(url, None)
+            waiter.set()
+    return result
 
 
 def _detect_image_mime(data: bytes) -> str:
@@ -2657,6 +2918,18 @@ _METADATA_WRITERS = {
 }
 
 
+def _write_song_metadata(tags: dict, filename: str) -> str:
+    """Write tags synchronously and return a concise status message."""
+    log.info("writing tags: %s", filename)
+    ext = os.path.splitext(filename)[1].lower()
+    writer = _METADATA_WRITERS.get(ext)
+    if writer is None:
+        return "Tags skipped (unsupported container)"
+    cover_bytes = _fetch_cover_bytes(tags.get("cover", ""))
+    writer(filename, tags, cover_bytes)
+    return "Tags added successfully"
+
+
 class WritingMetaTagsThread(QThread):
     tags_success = pyqtSignal(str)
 
@@ -2674,16 +2947,7 @@ class WritingMetaTagsThread(QThread):
         would repay the extra dependency surface for this project's scope.
         """
         try:
-            log.info("writing tags: %s", self.filename)
-            ext = os.path.splitext(self.filename)[1].lower()
-            writer = _METADATA_WRITERS.get(ext)
-            if writer is None:
-                self.tags_success.emit("Tags skipped (unsupported container)")
-                return
-
-            cover_bytes = _fetch_cover_bytes(self.tags.get("cover", ""))
-            writer(self.filename, self.tags, cover_bytes)
-            self.tags_success.emit("Tags added successfully")
+            self.tags_success.emit(_write_song_metadata(self.tags, self.filename))
         except Exception:
             log.error("tag write failed: %s", self.filename, exc_info=True)
 
@@ -2700,12 +2964,9 @@ class DownloadThumbnail(QThread):
     def run(self):
         if not self.url:
             return
-        try:
-            response = requests.get(self.url, stream=True, timeout=10)
-            if response.status_code == 200:
-                self.thumbnail_ready.emit(response.content)
-        except Exception as exc:
-            log.debug("thumbnail fetch failed: %s", exc)
+        data = _fetch_cover_bytes(self.url)
+        if data:
+            self.thumbnail_ready.emit(data)
 
     def _update_ui(self, data):
         """Update UI from main thread via signal."""
@@ -3460,6 +3721,7 @@ class MainWindow(QMainWindow, Ui_MainWindow):
                 spotify_url,
                 self.download_path,
                 cancel_event=self._cancel_event,
+                write_metadata=self.AddMetaDataCheck.isChecked(),
                 **scraper_kwargs_from(self._config),
             )
             self.scraper_thread.progress_update.connect(self.update_progress)
@@ -3514,7 +3776,10 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         """Update UI with current track info (called BEFORE download starts)."""
         if self.showPreviewCheck.isChecked():
             cover_url = song_meta.get("cover", "")
-            if cover_url:
+            active_thumbnails = sum(
+                isinstance(thread, DownloadThumbnail) for thread in self._active_threads
+            )
+            if cover_url and active_thumbnails < _MAX_THUMBNAIL_THREADS:
                 thumb_thread = DownloadThumbnail(cover_url, self)
                 self._active_threads.append(thumb_thread)
                 thumb_thread.finished.connect(lambda: self._cleanup_thread(thumb_thread))
@@ -3537,6 +3802,10 @@ class MainWindow(QMainWindow, Ui_MainWindow):
     @pyqtSlot(dict)
     def add_song_META(self, song_meta):
         if self.AddMetaDataCheck.isChecked():
+            completed_status = song_meta.get("_metadata_status")
+            if completed_status:
+                self.statusMsg.setText(completed_status)
+                return
             meta_thread = WritingMetaTagsThread(song_meta, song_meta["file"])
             meta_thread.tags_success.connect(lambda x: self.statusMsg.setText(f"{x}"))
             self._active_threads.append(meta_thread)

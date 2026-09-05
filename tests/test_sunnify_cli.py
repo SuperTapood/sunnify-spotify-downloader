@@ -145,15 +145,68 @@ class TestDownloadGuards:
         assert rc == cli.EXIT_FATAL
         assert json.loads(capsys.readouterr().out)["code"] == "folder_locked"
 
+    def test_setup_failure_releases_folder_lock(self, tmp_path, capsys):
+        with (
+            patch.object(sd, "get_ffmpeg_path", return_value="/usr/bin/true"),
+            patch.object(cli, "_build_scraper", side_effect=RuntimeError("setup failed")),
+        ):
+            rc = cli.cmd_download(
+                _args(
+                    url="https://open.spotify.com/track/0VjIjW4GlUZAMYd2vXMi3b",
+                    out=str(tmp_path),
+                    json=True,
+                )
+            )
+
+        assert rc == cli.EXIT_FATAL
+        assert json.loads(capsys.readouterr().out)["code"] == "run_failed"
+        replacement = cli._FolderLock(str(tmp_path))
+        assert replacement.acquire() is None
+        replacement.release()
+
 
 class TestFolderLock:
     def test_stale_lock_is_claimed(self, tmp_path):
         (tmp_path / cli._LOCK_NAME).write_text("999999999")
         lock = cli._FolderLock(str(tmp_path))
         assert lock.acquire() is None
-        assert (tmp_path / cli._LOCK_NAME).read_text() == str(os.getpid())
+        assert cli._read_lock_pid(str(tmp_path)) == os.getpid()
         lock.release()
-        assert not (tmp_path / cli._LOCK_NAME).exists()
+        assert (tmp_path / cli._LOCK_NAME).exists()
+        assert cli._read_lock_pid(str(tmp_path)) is None
+
+    def test_live_lock_is_not_overwritten(self, tmp_path, monkeypatch):
+        lock_path = tmp_path / cli._LOCK_NAME
+        lock_path.write_text("1234")
+        monkeypatch.setattr(cli, "_pid_alive", lambda pid: pid == 1234)
+
+        lock = cli._FolderLock(str(tmp_path))
+        assert "pid 1234" in lock.acquire()
+        assert lock_path.read_text().split("\x00", 1)[0] == "1234"
+
+    def test_stale_tokenized_marker_does_not_block_after_pid_reuse(self, tmp_path, monkeypatch):
+        lock_path = tmp_path / cli._LOCK_NAME
+        lock_path.write_text("1234:stale-owner")
+        monkeypatch.setattr(cli, "_pid_alive", lambda pid: pid in (1234, os.getpid()))
+
+        lock = cli._FolderLock(str(tmp_path))
+        assert lock.acquire() is None
+        assert cli._read_lock_pid(str(tmp_path)) == os.getpid()
+        lock.release()
+
+    def test_kernel_lock_excludes_a_second_owner_until_release(self, tmp_path):
+        first = cli._FolderLock(str(tmp_path))
+        second = cli._FolderLock(str(tmp_path))
+        assert first.acquire() is None
+        assert cli._read_lock_pid(str(tmp_path)) == os.getpid()
+
+        error = second.acquire()
+        assert error is not None and "another sunnify download" in error
+        assert cli._read_lock_pid(str(tmp_path)) == os.getpid()
+
+        first.release()
+        assert second.acquire() is None
+        second.release()
 
 
 class TestConfigCommand:
@@ -193,13 +246,16 @@ class TestStatusCommand:
             + "\n"
             + json.dumps({"id": "b", "file": "gone.mp3"})
             + "\n"
+            + json.dumps({"id": "c", "file": "directory.flac"})
+            + "\n"
         )
         (tmp_path / "here.mp3").write_bytes(b"x")
+        (tmp_path / "directory.flac").mkdir()
         rc = cli.cmd_status(SimpleNamespace(folder=str(tmp_path), json=True))
         assert rc == cli.EXIT_OK
         payload = json.loads(capsys.readouterr().out)
         assert payload["audio_files"] == 1
-        assert payload["recorded_but_missing"] == 1
+        assert payload["recorded_but_missing"] == 2
         assert payload["download_in_progress"] is False
 
 

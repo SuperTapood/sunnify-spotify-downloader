@@ -24,6 +24,8 @@ import signal
 import sys
 import threading
 import time
+import uuid
+from typing import Any
 
 import Spotify_Downloader as app
 from spotifydown_api import PlaylistClient, SpotifyEmbedAPI
@@ -34,6 +36,7 @@ EXIT_USAGE = 2  # argparse's own code for bad usage
 EXIT_FATAL = 3
 
 _LOCK_NAME = ".sunnify-cli.lock"
+_LOCK_BYTE_OFFSET = 255  # keep owner metadata readable while Windows locks byte 255
 
 
 def _ensure_windows_console() -> None:
@@ -73,7 +76,9 @@ def _ensure_windows_console() -> None:
     # unicode glyphs the CLI prints can never raise (real consoles use WriteConsoleW)
     for stream in (sys.stdout, sys.stderr):
         with contextlib.suppress(Exception):
-            stream.reconfigure(encoding="utf-8", errors="replace")
+            reconfigure = getattr(stream, "reconfigure", None)
+            if callable(reconfigure):
+                reconfigure(encoding="utf-8", errors="replace")
 
 
 class _Emitter:
@@ -148,33 +153,163 @@ def _pid_alive(pid: int) -> bool:
 
 def _read_lock_pid(folder: str) -> int | None:
     with contextlib.suppress(OSError, ValueError):
-        with open(os.path.join(folder, _LOCK_NAME), encoding="utf-8") as fh:
-            pid = int(fh.read().strip())
+        fd = os.open(os.path.join(folder, _LOCK_NAME), os.O_RDONLY)
+        try:
+            # v2.4.1 and older wrote just the pid. New locks append a unique
+            # ownership token; read only the metadata region because Windows
+            # deliberately locks the byte immediately after it.
+            raw = os.read(fd, _LOCK_BYTE_OFFSET)
+        finally:
+            os.close(fd)
+        contents = raw.split(b"\0", 1)[0].decode("utf-8", "replace").strip()
+        pid = int(contents.partition(":")[0])
         if _pid_alive(pid):
             return pid
     return None
 
 
 class _FolderLock:
-    """Pid lockfile so two CLI runs can't race the same folder; stale locks
-    (dead pid) are claimed silently."""
+    """Cross-platform OS lock so two CLI runs cannot write one folder.
+
+    The file itself remains as a status marker, but ownership is the kernel's
+    byte-range/advisory lock held on ``self._fd``. Kernel locks disappear when
+    a process crashes, avoiding every read/delete stale-pid race.
+    """
 
     def __init__(self, folder: str):
         self.path = os.path.join(folder, _LOCK_NAME)
         self.folder = folder
+        self._owner = f"{os.getpid()}:{uuid.uuid4().hex}"
+        self._held = False
+        self._fd: int | None = None
+
+    @staticmethod
+    def _lock_fd(fd: int) -> None:
+        os.lseek(fd, _LOCK_BYTE_OFFSET, os.SEEK_SET)
+        if sys.platform == "win32":
+            import msvcrt
+
+            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+    @staticmethod
+    def _unlock_fd(fd: int) -> None:
+        os.lseek(fd, _LOCK_BYTE_OFFSET, os.SEEK_SET)
+        if sys.platform == "win32":
+            import msvcrt
+
+            msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(fd, fcntl.LOCK_UN)
+
+    @staticmethod
+    def _read_fd(fd: int) -> str:
+        os.lseek(fd, 0, os.SEEK_SET)
+        raw = os.read(fd, _LOCK_BYTE_OFFSET)
+        return raw.split(b"\0", 1)[0].decode("utf-8", "replace").strip()
+
+    @staticmethod
+    def _write_fd(fd: int, value: str) -> None:
+        payload = value.encode("utf-8")
+        if len(payload) >= _LOCK_BYTE_OFFSET:
+            raise OSError("folder lock owner metadata is too long")
+        # Zero-fill the metadata region so replacing a longer prior token
+        # cannot leave parseable garbage behind it. Byte 255 stays untouched
+        # and locked for the lifetime of the owner.
+        payload += b"\0" * (_LOCK_BYTE_OFFSET - len(payload))
+        os.lseek(fd, 0, os.SEEK_SET)
+        offset = 0
+        while offset < len(payload):
+            written = os.write(fd, payload[offset:])
+            if written <= 0:
+                raise OSError("short write updating folder lock")
+            offset += written
+        os.ftruncate(fd, _LOCK_BYTE_OFFSET + 1)
+        os.fsync(fd)
 
     def acquire(self) -> str | None:
         """Return an error message, or None once the lock is held."""
-        pid = _read_lock_pid(self.folder)
-        if pid is not None and pid != os.getpid():
-            return f"another sunnify download (pid {pid}) is writing to this folder"
-        with contextlib.suppress(OSError), open(self.path, "w", encoding="utf-8") as fh:
-            fh.write(str(os.getpid()))
+        if self._held:
+            return None
+
+        try:
+            fd = os.open(self.path, os.O_RDWR | os.O_CREAT, 0o600)
+        except OSError as exc:
+            return f"cannot create sunnify folder lock: {exc}"
+
+        try:
+            # Windows cannot lock a byte beyond EOF. Seed the dedicated lock
+            # byte before contending; simultaneous zero-byte writes are
+            # harmless because the kernel lock is the ownership primitive.
+            if os.fstat(fd).st_size <= _LOCK_BYTE_OFFSET:
+                os.lseek(fd, _LOCK_BYTE_OFFSET, os.SEEK_SET)
+                os.write(fd, b"\0")
+                os.fsync(fd)
+            self._lock_fd(fd)
+        except OSError:
+            owner = ""
+            with contextlib.suppress(OSError):
+                owner = self._read_fd(fd)
+            owner_pid = None
+            with contextlib.suppress(ValueError):
+                owner_pid = int(owner.partition(":")[0])
+            os.close(fd)
+            if owner_pid is not None:
+                return f"another sunnify download (pid {owner_pid}) is writing to this folder"
+            return "another sunnify download is writing to this folder"
+
+        try:
+            # Respect a live legacy (pre-OS-lock) pidfile after we have won the
+            # new lock, so upgrades do not overlap an older active CLI.
+            previous = self._read_fd(fd)
+            previous_pid = None
+            # Only pre-kernel-lock releases wrote a bare PID. A modern
+            # ``pid:token`` marker without a held OS lock is stale by
+            # definition; trusting its PID would fail after PID reuse.
+            if ":" not in previous:
+                with contextlib.suppress(ValueError):
+                    previous_pid = int(previous)
+            if (
+                previous_pid is not None
+                and previous_pid not in (0, os.getpid())
+                and _pid_alive(previous_pid)
+            ):
+                self._unlock_fd(fd)
+                os.close(fd)
+                return f"another sunnify download (pid {previous_pid}) is writing to this folder"
+            self._write_fd(fd, self._owner + "\n")
+        except OSError as exc:
+            with contextlib.suppress(OSError):
+                self._unlock_fd(fd)
+            os.close(fd)
+            return f"cannot write sunnify folder lock: {exc}"
+
+        self._fd = fd
+        self._held = True
         return None
 
     def release(self) -> None:
-        with contextlib.suppress(OSError):
-            os.remove(self.path)
+        if not self._held:
+            return
+        fd, self._fd = self._fd, None
+        self._held = False
+        if fd is None:
+            return
+        try:
+            # Keep one byte in the persistent marker so the next Windows
+            # process can lock it immediately; pid 0 is never considered live.
+            with contextlib.suppress(OSError):
+                self._write_fd(fd, "0\n")
+        finally:
+            with contextlib.suppress(OSError):
+                self._unlock_fd(fd)
+            with contextlib.suppress(OSError):
+                os.close(fd)
 
 
 class _RunState:
@@ -207,13 +342,18 @@ class _RunState:
         with self._lock:
             pre = path in self._preexisting
         if pre:
-            self.skipped.append(path)
+            with self._lock:
+                self.skipped.append(path)
             self.emitter.event("track_skipped", title=meta.get("title", ""), file=path)
             return
-        # same tag writer the GUI uses, run synchronously (no thread started)
-        app.WritingMetaTagsThread(meta, path).run()
+        # Normal CLI runs write tags inside the bounded download workers. Keep
+        # this fallback for custom/older scraper instances without rewriting
+        # every file or downloading the same cover twice.
+        if "_metadata_status" not in meta:
+            app.WritingMetaTagsThread(meta, path).run()
         if os.path.exists(path):
-            self.landed.append(path)
+            with self._lock:
+                self.landed.append(path)
             self.emitter.event(
                 "track_done",
                 title=meta.get("title", ""),
@@ -240,7 +380,9 @@ def _resolve_settings(args, cfg: dict) -> dict:
 
 def _build_scraper(args, cfg: dict, cancel_event: threading.Event) -> app.MusicScraper:
     return app.MusicScraper(
-        cancel_event=cancel_event, **app.scraper_kwargs_from(_resolve_settings(args, cfg))
+        cancel_event=cancel_event,
+        write_metadata=True,
+        **app.scraper_kwargs_from(_resolve_settings(args, cfg)),
     )
 
 
@@ -307,77 +449,88 @@ def cmd_download(args) -> int:
         )
         return EXIT_FATAL
 
-    cancel_event = threading.Event()
-    scraper = _build_scraper(args, cfg, cancel_event)
-    state = _RunState(emitter)
-    # workers emit from pool threads; with no qt event loop running, queued
-    # (auto) connections are never delivered, so force direct delivery
-    from PyQt6.QtCore import Qt
-
-    direct = Qt.ConnectionType.DirectConnection
-    scraper.song_meta.connect(state.on_song_meta, type=direct)
-    scraper.add_song_meta.connect(state.on_add_song_meta, type=direct)
-    scraper.resume_skipped.connect(state.on_resume_skipped, type=direct)
-    scraper.error_signal.connect(state.on_error, type=direct)
-
-    # graceful ^C: first stops after in-flight tracks, second is immediate
-    def _sigint(_sig, _frame):
-        if cancel_event.is_set():
-            lock.release()
-            os._exit(130)
-        cancel_event.set()
-        emitter.error("stopping after in-flight tracks finish (^C again to force quit)")
-
-    with contextlib.suppress(Exception):
-        signal.signal(signal.SIGINT, _sigint)
-
-    emitter.event(
-        "run_started",
-        url=args.url,
-        type=url_type,
-        folder=out_dir,
-        format=scraper.audio_format,
-        quality=scraper.audio_quality,
-        sample_rate=scraper.sample_rate,
-        artist_first=scraper.artist_first,
-        title_only=scraper.title_only,
-        track_numbers=scraper.include_track_number,
-        loose_match=scraper.loose_match,
-    )
-    t0 = time.monotonic()
+    scraper = None
+    previous_sigint = None
     try:
+        cancel_event = threading.Event()
+        scraper = _build_scraper(args, cfg, cancel_event)
+        state = _RunState(emitter)
+        # workers emit from pool threads; with no qt event loop running, queued
+        # (auto) connections are never delivered, so force direct delivery
+        from PyQt6.QtCore import Qt
+
+        direct = Qt.ConnectionType.DirectConnection
+        scraper.song_meta.connect(state.on_song_meta, type=direct)
+        scraper.add_song_meta.connect(state.on_add_song_meta, type=direct)
+        scraper.resume_skipped.connect(state.on_resume_skipped, type=direct)
+        scraper.error_signal.connect(state.on_error, type=direct)
+
+        # graceful ^C: first stops after in-flight tracks, second is immediate
+        def _sigint(_sig, _frame):
+            if cancel_event.is_set():
+                # Process termination releases the kernel lock atomically
+                # after worker threads are gone. Unlocking first would create
+                # a window where another process can enter the same folder.
+                os._exit(130)
+            cancel_event.set()
+            emitter.error("stopping after in-flight tracks finish (^C again to force quit)")
+
+        with contextlib.suppress(Exception):
+            previous_sigint = signal.getsignal(signal.SIGINT)
+            signal.signal(signal.SIGINT, _sigint)
+
+        emitter.event(
+            "run_started",
+            url=args.url,
+            type=url_type,
+            folder=out_dir,
+            format=scraper.audio_format,
+            quality=scraper.audio_quality,
+            sample_rate=scraper.sample_rate,
+            artist_first=scraper.artist_first,
+            title_only=scraper.title_only,
+            track_numbers=scraper.include_track_number,
+            loose_match=scraper.loose_match,
+        )
+        t0 = time.monotonic()
         if url_type == "track":
             scraper.scrape_track(args.url, out_dir)
         else:
             scraper.scrape_playlist(args.url, out_dir)
+
+        failed = list(scraper._failed_tracks)
+        stopped = cancel_event.is_set()
+        code = EXIT_PARTIAL if (failed or stopped) else EXIT_OK
+        emitter.event(
+            "run_summary",
+            landed=len(state.landed),
+            skipped=len(state.skipped) + state.resume_skipped,
+            failed=len(failed),
+            failed_titles=failed,
+            stopped=stopped,
+            elapsed_s=round(time.monotonic() - t0, 1),
+            folder=out_dir,
+            exit_code=code,
+        )
+        if failed and not args.json:
+            for title in failed:
+                print(f"  failed: {title}", file=sys.stderr)
+        return code
     except Exception as exc:
         emitter.error(f"download run failed: {exc}", code="run_failed", hint="run `sunnify doctor`")
         return EXIT_FATAL
     finally:
+        if previous_sigint is not None:
+            with contextlib.suppress(Exception):
+                signal.signal(signal.SIGINT, previous_sigint)
+        if scraper is not None:
+            scraper.close()
         lock.release()
-
-    failed = list(scraper._failed_tracks)
-    stopped = cancel_event.is_set()
-    code = EXIT_PARTIAL if (failed or stopped) else EXIT_OK
-    emitter.event(
-        "run_summary",
-        landed=len(state.landed),
-        skipped=len(state.skipped) + state.resume_skipped,
-        failed=len(failed),
-        failed_titles=failed,
-        stopped=stopped,
-        elapsed_s=round(time.monotonic() - t0, 1),
-        folder=out_dir,
-        exit_code=code,
-    )
-    if failed and not args.json:
-        for title in failed:
-            print(f"  failed: {title}", file=sys.stderr)
-    return code
 
 
 def cmd_info(args) -> int:
     emitter = _Emitter(args.json)
+    payload: dict[str, Any]
     try:
         url_type, item_id = app.detect_spotify_url_type(args.url)
     except ValueError:
@@ -391,7 +544,11 @@ def cmd_info(args) -> int:
         return EXIT_FATAL
     try:
         if url_type == "track":
-            track = SpotifyEmbedAPI().get_track(item_id)
+            track_client = SpotifyEmbedAPI()
+            try:
+                track = track_client.get_track(item_id)
+            finally:
+                track_client.close()
             payload = {
                 "type": "track",
                 "id": track.spotify_id,
@@ -403,16 +560,19 @@ def cmd_info(args) -> int:
             }
         else:
             client = PlaylistClient()
-            meta = client.get_playlist_metadata(item_id, content_type=url_type)
-            tracks = [
-                {
-                    "id": t.spotify_id,
-                    "title": t.title,
-                    "artists": t.artists,
-                    "duration_ms": t.duration_ms or 0,
-                }
-                for t in client.iter_playlist_tracks(item_id, content_type=url_type)
-            ]
+            try:
+                meta = client.get_playlist_metadata(item_id, content_type=url_type)
+                tracks = [
+                    {
+                        "id": t.spotify_id,
+                        "title": t.title,
+                        "artists": t.artists,
+                        "duration_ms": t.duration_ms or 0,
+                    }
+                    for t in client.iter_playlist_tracks(item_id, content_type=url_type)
+                ]
+            finally:
+                client.close()
             payload = {
                 "type": url_type,
                 "id": item_id,
@@ -444,26 +604,26 @@ def cmd_status(args) -> int:
     cfg = app.load_config()
     folder = os.path.abspath(os.path.expanduser(args.folder or _resolve_out_dir(None, cfg)))
     manifest = os.path.join(folder, app.MANIFEST_FILENAME)
-    entries: list[dict] = []
-    if os.path.exists(manifest):
-        with contextlib.suppress(OSError), open(manifest, encoding="utf-8") as fh:
-            for line in fh:
-                with contextlib.suppress(ValueError):
-                    entries.append(json.loads(line))
+    entries = list(app._iter_manifest_records(manifest))
     # manifest records store basenames relative to their folder; single-track
     # downloads never write a manifest, so count real audio files too
-    on_disk = [e for e in entries if os.path.exists(os.path.join(folder, e.get("file", "")))]
-    missing = [e for e in entries if e not in on_disk]
+    missing_count = sum(
+        not os.path.isfile(os.path.join(folder, entry["file"])) for entry in entries
+    )
     exts = tuple(f".{spec['ext']}" for spec in app.SUPPORTED_FORMATS.values())
     audio_files: list[str] = []
     with contextlib.suppress(OSError):
-        audio_files = sorted(n for n in os.listdir(folder) if n.lower().endswith(exts))
+        audio_files = sorted(
+            name
+            for name in os.listdir(folder)
+            if name.lower().endswith(exts) and os.path.isfile(os.path.join(folder, name))
+        )
     active_pid = _read_lock_pid(folder)
     payload = {
         "folder": folder,
         "audio_files": len(audio_files),
         "manifest_entries": len(entries),
-        "recorded_but_missing": len(missing),
+        "recorded_but_missing": missing_count,
         "download_in_progress": active_pid is not None,
         "active_pid": active_pid,
     }
@@ -472,7 +632,7 @@ def cmd_status(args) -> int:
     else:
         state = f"downloading now (pid {active_pid})" if active_pid else "idle"
         print(
-            f"{folder}: {len(audio_files)} audio files, {len(missing)} recorded but missing, {state}"
+            f"{folder}: {len(audio_files)} audio files, {missing_count} recorded but missing, {state}"
         )
     return EXIT_OK
 
@@ -538,13 +698,16 @@ def cmd_doctor(args) -> int:
     checks.append({"check": "config", "ok": cfg_ok, "detail": cfg_detail})
     checks.append({"check": "logs", "ok": True, "detail": app._log_dir()})
 
+    spotify_client = SpotifyEmbedAPI()
     try:
-        SpotifyEmbedAPI().get_track("4uLU6hMCjMI75M1A2tKUQC")  # never gonna give you up
+        spotify_client.get_track("4uLU6hMCjMI75M1A2tKUQC")  # never gonna give you up
         checks.append(
             {"check": "spotify_metadata", "ok": True, "detail": "embed endpoint reachable"}
         )
     except Exception as exc:
         checks.append({"check": "spotify_metadata", "ok": False, "detail": str(exc)})
+    finally:
+        spotify_client.close()
 
     try:
         import yt_dlp
@@ -728,7 +891,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     try:
-        rc = args.func(args)
+        rc = int(args.func(args))
     except KeyboardInterrupt:
         rc = 130
     with contextlib.suppress(Exception):

@@ -238,6 +238,17 @@ class TestCapFilename:
         out = cap_filename("y" * 400)  # no extension
         assert len(out.encode("utf-8")) <= 250
 
+    def test_preserves_requested_stem_suffix_when_truncating(self):
+        from spotifydown_api import cap_filename
+
+        out = cap_filename(
+            ("夜" * 300) + " [spotify-id].flac",
+            preserve_stem_suffix=" [spotify-id]",
+        )
+
+        assert len(out.encode("utf-8")) <= 250
+        assert out.endswith(" [spotify-id].flac")
+
 
 class TestSpotifyEmbedAPI:
     """Tests for SpotifyEmbedAPI class."""
@@ -254,6 +265,126 @@ class TestSpotifyEmbedAPI:
         session = requests.Session()
         api = SpotifyEmbedAPI(session=session)
         assert api._session is session
+
+    def test_embed_rejects_non_object_next_data(self):
+        from unittest.mock import MagicMock
+
+        session = MagicMock()
+        session.get.return_value.status_code = 200
+        session.get.return_value.text = '<script id="__NEXT_DATA__">[]</script>'
+        api = SpotifyEmbedAPI(session=session)
+
+        with pytest.raises(ExtractionError, match="not a JSON object"):
+            api._fetch_embed_data("https://example.test/embed")
+
+    def test_owned_sessions_are_isolated_per_worker_and_closed(self, monkeypatch):
+        """Concurrent enrichment must not share requests.Session state."""
+        import threading
+
+        import spotifydown_api as module
+
+        created = []
+
+        class FakeSession:
+            def __init__(self):
+                self.closed = False
+                created.append(self)
+
+            def close(self):
+                self.closed = True
+
+        monkeypatch.setattr(module.requests, "Session", FakeSession)
+        api = module.SpotifyEmbedAPI()
+        barrier = threading.Barrier(3, timeout=5)
+        sessions = []
+
+        def select_session():
+            sessions.append(api._request_session())
+            barrier.wait()
+
+        workers = [threading.Thread(target=select_session) for _ in range(2)]
+        for worker in workers:
+            worker.start()
+        barrier.wait()
+        for worker in workers:
+            worker.join()
+
+        assert len({id(session) for session in sessions}) == 2
+        assert all(session is not api._session for session in sessions)
+        api.close()
+        assert created and all(session.closed for session in created)
+
+    def test_collection_snapshots_are_reused_between_metadata_and_tracks(self):
+        """The standard two-call download flow should fetch each endpoint once."""
+        api = SpotifyEmbedAPI()
+        embed_calls = []
+        spclient_calls = []
+        embed = {
+            "props": {
+                "pageProps": {
+                    "state": {
+                        "data": {
+                            "entity": {
+                                "name": "Cached",
+                                "trackList": [
+                                    {
+                                        "uri": "spotify:track:t1",
+                                        "title": "One",
+                                        "subtitle": "Artist",
+                                        "duration": 1000,
+                                    }
+                                ],
+                            }
+                        },
+                        "settings": {
+                            "session": {
+                                "accessToken": "token",
+                                "accessTokenExpirationTimestampMs": 9999999999999,
+                            }
+                        },
+                    }
+                }
+            }
+        }
+
+        def fetch(url):
+            embed_calls.append(url)
+            api._cached_token = "token"
+            return embed
+
+        class Response:
+            status_code = 200
+
+            @staticmethod
+            def json():
+                return {
+                    "length": 1,
+                    "contents": {"items": [{"uri": "spotify:track:t1"}]},
+                }
+
+        def get(*_args, **_kwargs):
+            spclient_calls.append(1)
+            return Response()
+
+        api._fetch_embed_data = fetch  # type: ignore[assignment]
+        api._session.get = get  # type: ignore[assignment]
+
+        assert api.get_playlist_metadata("PL").track_count == 1
+        assert [track.id for track in api.iter_playlist_tracks("PL")] == ["t1"]
+        assert len(embed_calls) == 1
+        assert len(spclient_calls) == 1
+
+    def test_large_playlist_metadata_pool_is_reused_and_closed(self):
+        """A backend client must not retain four new worker sessions per request."""
+        api = SpotifyEmbedAPI()
+
+        first = api._get_metadata_pool()
+        second = api._get_metadata_pool()
+
+        assert second is first
+        assert first.submit(lambda: 42).result(timeout=5) == 42
+        api.close()
+        assert api._metadata_pool is None
 
     def test_headers_include_user_agent(self):
         """Headers should include a user agent."""
