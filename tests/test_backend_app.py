@@ -161,6 +161,43 @@ class TestScrapePlaylistEndpoint:
         assert data["data"]["tracks"][0]["title"] == "Test Song"
 
     @patch("app.get_playlist_client")
+    def test_artist_url_routes_to_full_discography(self, mock_get_client, client):
+        from spotifydown_api import PlaylistInfo, TrackInfo
+
+        api = mock_get_client.return_value
+        api.get_playlist_metadata.return_value = PlaylistInfo(
+            name="Artist - Discography", owner=None, description=None, cover_url=None, track_count=1
+        )
+        api.iter_playlist_tracks.return_value = [
+            TrackInfo(
+                id="song",
+                title="Song",
+                artists="Artist",
+                album="Album",
+                release_date="2024",
+                cover_url="https://example.com/album.jpg",
+                duration_ms=180000,
+                preview_url=None,
+                raw={},
+            )
+        ]
+        response = client.post(
+            "/api/scrape-playlist",
+            json={"playlistUrl": "https://open.spotify.com/artist/4Z8W4fKeB5YxbusRsdQVPb"},
+        )
+        assert response.status_code == 200
+        data = response.get_json()["data"]
+        assert data["playlistName"] == "Artist - Discography"
+        assert data["tracks"][0]["album"] == "Album"
+        assert data["tracks"][0]["cover"] == "https://example.com/album.jpg"
+        api.get_playlist_metadata.assert_called_once_with(
+            "4Z8W4fKeB5YxbusRsdQVPb", content_type="artist"
+        )
+        api.iter_playlist_tracks.assert_called_once_with(
+            "4Z8W4fKeB5YxbusRsdQVPb", content_type="artist"
+        )
+
+    @patch("app.get_playlist_client")
     def test_valid_track_url(self, mock_get_client, client):
         """Single tracks reuse the shared client instead of opening a new session."""
         mock_client = MagicMock()
@@ -208,6 +245,78 @@ class TestScrapePlaylistEndpoint:
             "event": "error",
             "data": {"message": "Internal server error"},
         }
+
+
+class TestMultipleUrls:
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            {"playlistUrls": ["spotify:artist:artist", "spotify:track:song"]},
+            {"playlistUrl": "spotify:artist:artist\nspotify:track:song"},
+        ],
+    )
+    @patch("app.get_playlist_client")
+    @patch("app._fetch_collection")
+    def test_batch_combines_results_and_deduplicates_tracks(
+        self, fetch, get_client, client, payload
+    ):
+        fetch.side_effect = [
+            ("Artist - Discography", [{"id": "shared"}, {"id": "artist-song"}]),
+            ("Song", [{"id": "shared"}]),
+        ]
+        response = client.post("/api/scrape-playlist", json=payload)
+        assert response.status_code == 200
+        data = response.get_json()["data"]
+        assert data["playlistName"] == "2 of 2 URLs"
+        assert data["tracks"] == [{"id": "shared"}, {"id": "artist-song"}]
+        assert data["errors"] == []
+        assert [call.args[1] for call in fetch.call_args_list] == [
+            "spotify:artist:artist",
+            "spotify:track:song",
+        ]
+        get_client.assert_called_once_with()
+
+    @patch("app.get_playlist_client")
+    @patch("app._fetch_collection")
+    def test_batch_retains_successes_and_sanitizes_errors(self, fetch, get_client, client):
+        from spotifydown_api import SpotifyDownAPIError
+
+        fetch.side_effect = [SpotifyDownAPIError("private detail"), ("Song", [{"id": "song"}])]
+        response = client.post(
+            "/api/scrape-playlist",
+            json={"playlistUrls": ["spotify:artist:bad", "spotify:track:song"]},
+        )
+        assert response.status_code == 200
+        data = response.get_json()["data"]
+        assert data["tracks"] == [{"id": "song"}]
+        assert data["errors"] == [{"url": "spotify:artist:bad", "message": "Spotify API error"}]
+        assert "private detail" not in response.get_data(as_text=True)
+
+    @pytest.mark.parametrize(
+        "urls", [["spotify:track:song", "invalid"], ["spotify:track:song", None], [], 123]
+    )
+    @patch("app.get_playlist_client")
+    def test_invalid_batch_does_not_fetch_any_url(self, get_client, client, urls):
+        response = client.post("/api/scrape-playlist", json={"playlistUrls": urls})
+        assert response.status_code == 400
+        get_client.assert_not_called()
+
+    @patch("app.get_playlist_client")
+    @patch("app._fetch_collection")
+    def test_duplicate_resources_are_only_fetched_once(self, fetch, get_client, client):
+        fetch.return_value = ("Song", [{"id": "song"}])
+        response = client.post(
+            "/api/scrape-playlist",
+            json={
+                "playlistUrls": [
+                    "spotify:track:song",
+                    "https://open.spotify.com/track/song?si=shared",
+                ]
+            },
+        )
+        assert response.status_code == 200
+        assert fetch.call_count == 1
+        assert response.get_json()["data"] == {"playlistName": "Song", "tracks": [{"id": "song"}]}
 
 
 class TestCORS:

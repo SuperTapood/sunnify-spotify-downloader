@@ -20,7 +20,6 @@ import {
   Coffee,
 } from "lucide-react"
 import { Button } from "@/components/ui/button"
-import { Input } from "@/components/ui/input"
 import { Progress } from "@/components/ui/progress"
 import { ScrollArea } from "@/components/ui/scroll-area"
 import { toast, Toaster } from "react-hot-toast"
@@ -47,30 +46,40 @@ export default function SunnifyApp() {
   const [tracks, setTracks] = useState<Track[]>([])
   const [selectedTrack, setSelectedTrack] = useState<Track | null>(null)
   const [showBanner, setShowBanner] = useState(true)
+  const [urlErrors, setUrlErrors] = useState<{ url: string; message: string }[]>([])
 
   const handleProcess = async () => {
-    if (!playlistLink) {
-      toast.error("Please enter a Spotify URL")
+    if (!playlistLink.trim()) {
+      toast.error("Please enter at least one Spotify URL")
       return
     }
 
-    // validate by hostname, not substring: "evil.com/open.spotify.com" must not pass
-    let host = ""
-    try {
-      host = new URL(playlistLink).hostname
-    } catch {
-      host = ""
-    }
-    if (host !== "open.spotify.com") {
-      toast.error("Invalid URL - must be from open.spotify.com")
-      return
+    const urls: string[] = []
+    const resources = new Set<string>()
+    for (const url of playlistLink
+      .trim()
+      .split(/[\s,]+/)
+      .filter(Boolean)) {
+      const match = url.match(
+        /^(?:https?:\/\/open\.spotify\.com\/(?:intl-[a-z]{2,}\/)?|spotify:)(playlist|album|artist|track)[/:]([a-zA-Z0-9]+)\/?(?:\?[^#\s]*)?(?:#[^\s]*)?$/
+      )
+      if (!match) {
+        toast.error(`Invalid Spotify URL: ${url}`)
+        return
+      }
+      const resource = `${match[1]}:${match[2]}`
+      if (!resources.has(resource)) {
+        resources.add(resource)
+        urls.push(url)
+      }
     }
 
     setIsProcessing(true)
     setDownloadProgress(0)
     setSongsDownloaded(0)
     setTotalSongs(0)
-    setStatusMessage("Fetching playlist data...")
+    setStatusMessage(`Fetching ${urls.length} URL(s)...`)
+    setUrlErrors([])
     setTracks([])
     setSelectedTrack(null)
 
@@ -80,7 +89,9 @@ export default function SunnifyApp() {
         {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ playlistUrl: playlistLink }),
+          body: JSON.stringify(
+            urls.length === 1 ? { playlistUrl: urls[0] } : { playlistUrls: urls }
+          ),
         }
       )
 
@@ -91,17 +102,27 @@ export default function SunnifyApp() {
       if (result.event === "complete") {
         setPlaylistName(result.data.playlistName || "Playlist")
         const processedTracks: Track[] = result.data.tracks || []
+        const errors: { url: string; message: string }[] = result.data.errors || []
+        setUrlErrors(errors)
         setTracks(processedTracks)
         setTotalSongs(processedTracks.length)
         setSongsDownloaded(processedTracks.length)
         setDownloadProgress(100)
-        setStatusMessage(`Found ${processedTracks.length} tracks`)
+        setStatusMessage(
+          errors.length
+            ? `Found ${processedTracks.length} tracks; ${errors.length} URL(s) failed`
+            : `Found ${processedTracks.length} tracks`
+        )
 
         if (processedTracks.length > 0) {
           setSelectedTrack(processedTracks[0])
         }
 
-        toast.success(`Loaded ${processedTracks.length} tracks!`)
+        if (errors.length) {
+          toast.error(`${errors.length} URL(s) failed. See details below.`)
+        } else {
+          toast.success(`Loaded ${processedTracks.length} tracks!`)
+        }
       } else if (result.event === "error") {
         throw new Error(result.data?.message || "Processing failed")
       }
@@ -205,14 +226,23 @@ export default function SunnifyApp() {
 
                 <div className="flex gap-4">
                   <div className="relative flex-1">
-                    <Input
-                      type="text"
-                      placeholder="https://open.spotify.com/playlist/..."
+                    <textarea
+                      aria-label="Spotify URLs"
+                      rows={3}
+                      placeholder="Paste Spotify URLs, one per line"
                       value={playlistLink}
                       onChange={(e) => setPlaylistLink(e.target.value)}
-                      onKeyDown={(e) => e.key === "Enter" && !isProcessing && handleProcess()}
-                      className="h-14 rounded-xl border-white/10 bg-black/50 pl-5 pr-5 text-base text-white placeholder:text-gray-500 focus:border-green-500 focus:ring-2 focus:ring-green-500/20"
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter" && (e.ctrlKey || e.metaKey) && !isProcessing) {
+                          e.preventDefault()
+                          handleProcess()
+                        }
+                      }}
+                      className="min-h-28 w-full resize-y rounded-xl border border-white/10 bg-black/50 px-5 py-3 text-base text-white placeholder:text-gray-500 focus:border-green-500 focus:ring-2 focus:ring-green-500/20"
                     />
+                    <p className="mt-2 text-xs text-gray-400">
+                      Separate URLs with newlines, spaces, or commas. Ctrl/Cmd+Enter to fetch.
+                    </p>
                   </div>
                   <Button
                     onClick={handleProcess}
@@ -246,9 +276,18 @@ export default function SunnifyApp() {
                   />
                   {playlistName && (
                     <p className="text-sm">
-                      <span className="text-gray-500">Playlist:</span>{" "}
+                      <span className="text-gray-500">Sources:</span>{" "}
                       <span className="font-medium text-white">{playlistName}</span>
                     </p>
+                  )}
+                  {urlErrors.length > 0 && (
+                    <ul className="space-y-2 text-sm text-red-300" aria-live="polite">
+                      {urlErrors.map((error) => (
+                        <li key={error.url} className="break-all">
+                          {error.url}: {error.message}
+                        </li>
+                      ))}
+                    </ul>
                   )}
                 </div>
               </div>
@@ -269,7 +308,7 @@ export default function SunnifyApp() {
                   </div>
                   <p className="text-lg font-medium text-gray-400">No tracks yet</p>
                   <p className="mt-1 text-sm text-gray-600">
-                    Enter a Spotify playlist or track URL above
+                    Enter a Spotify playlist, album, artist, or track URL above
                   </p>
                 </div>
               ) : (

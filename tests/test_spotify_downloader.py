@@ -347,6 +347,62 @@ class TestResumeManifest:
 class TestDownloadTrackAudioOpts:
     """Tests for yt-dlp performance options in download_track_audio."""
 
+    def test_firefox_cookies_used_for_search_and_download(self, tmp_path, monkeypatch):
+        import Spotify_Downloader as module
+
+        scraper = module.MusicScraper()
+        monkeypatch.setattr(module, "get_ffmpeg_path", lambda: str(tmp_path))
+        options_seen = []
+
+        class FakeYDL:
+            cookiejar = object()
+
+            def __init__(self, opts):
+                options_seen.append(opts)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def extract_info(self, url, download=False):
+                if not download:
+                    return {"entries": [{"id": "song", "title": "Artist - Song", "channel": "Artist", "duration": 180}]}
+                (tmp_path / "song.mp3").write_bytes(b"audio")
+
+        monkeypatch.setattr(module, "YoutubeDL", FakeYDL)
+        scraper.download_track_audio(
+            "ytsearch1:Song Artist audio", str(tmp_path / "song.mp3"),
+            expected_duration_s=180, expected_title="Song", expected_artists="Artist",
+        )
+        assert len(options_seen) == 2
+        assert all(opts["cookiesfrombrowser"] == ("firefox",) for opts in options_seen)
+
+    def test_missing_firefox_cookies_falls_back_to_anonymous(self, monkeypatch):
+        import Spotify_Downloader as module
+
+        scraper = module.MusicScraper()
+        options_seen = []
+
+        class FakeYDL:
+            def __init__(self, opts):
+                options_seen.append(dict(opts))
+
+            @property
+            def cookiejar(self):
+                raise module.CookieLoadError("missing Firefox profile")
+
+            def close(self):
+                pass
+
+        monkeypatch.setattr(module, "YoutubeDL", FakeYDL)
+        scraper._youtube_dl({"quiet": True})
+        scraper._youtube_dl({"quiet": True})
+        assert [opts.get("cookiesfrombrowser") for opts in options_seen] == [
+            ("firefox",), None, None,
+        ]
+
     def test_ydl_opts_include_retries(self):
         """Verify yt-dlp retries option is set."""
         from Spotify_Downloader import MusicScraper
@@ -438,6 +494,52 @@ class TestDownloadTrackAudioOpts:
             "https://www.youtube.com/watch?v=same",
             "https://www.youtube.com/watch?v=same",
         ]
+
+    def test_unavailable_video_retries_another_matching_result(self, tmp_path, monkeypatch):
+        import Spotify_Downloader as module
+
+        scraper = module.MusicScraper()
+        monkeypatch.setattr(module, "get_ffmpeg_path", lambda: str(tmp_path))
+        destination = tmp_path / "song.mp3"
+        searched = []
+        downloaded = []
+
+        class FakeYDL:
+            def __init__(self, _opts):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def extract_info(self, url, download=False):
+                if not download:
+                    searched.append(url)
+                    return {"entries": [
+                        {"id": "unavailable", "title": "Artist - Song", "channel": "Artist", "duration": 180},
+                        {"id": "wrong", "title": "Artist - Other Tune", "channel": "Artist", "duration": 180},
+                        {"id": "playable", "title": "Artist - Song", "channel": "Artist", "duration": 181},
+                    ]}
+                downloaded.append(url)
+                if url.endswith("playable"):
+                    destination.write_bytes(b"audio")
+                return None
+
+        monkeypatch.setattr(module, "YoutubeDL", FakeYDL)
+        result = scraper.download_track_audio(
+            "ytsearch1:Song Artist audio",
+            str(destination),
+            expected_duration_s=180,
+            expected_title="Song",
+            expected_artists="Artist",
+        )
+
+        assert result == str(destination)
+        assert searched  # a second search excludes the unavailable result
+        assert downloaded[-1] == "https://www.youtube.com/watch?v=playable"
+        assert all("wrong" not in url for url in downloaded)
 
     def test_selector_bot_gate_sets_circuit_breaker(self, monkeypatch):
         import Spotify_Downloader as module
@@ -2254,8 +2356,8 @@ class TestParallelDownloads:
 
         assert len(scraper._failed_tracks) == n
 
-    def test_small_playlist_stays_sequential(self, tmp_path):
-        """Playlists under the parallel threshold (3 tracks) run on one thread."""
+    def test_two_track_playlist_downloads_in_parallel(self, tmp_path):
+        """A pair of tracks should overlap network work too."""
         from Spotify_Downloader import MusicScraper
 
         scraper = MusicScraper()
@@ -2274,9 +2376,11 @@ class TestParallelDownloads:
 
         tracks = [self._make_track(f"id{i}", f"Song {i}") for i in range(2)]
         seen_workers: set[str] = set()
+        both_started = threading.Barrier(2)
 
         def fake_download(query, dest, **_kw):
             seen_workers.add(threading.current_thread().name)
+            both_started.wait(timeout=5)
             open(dest, "wb").close()
             return dest
 
@@ -2293,8 +2397,8 @@ class TestParallelDownloads:
 
         scraper.scrape_playlist("https://open.spotify.com/playlist/abc123", str(tmp_path))
 
-        # All 2 downloads happened on the main test thread — no pool spawned
-        assert seen_workers == {threading.current_thread().name}
+        assert len(seen_workers) == 2
+        assert threading.current_thread().name not in seen_workers
         assert scraper._parallel_mode is False
 
     def test_parallel_playlist_uses_max_workers_threads(self, tmp_path):
@@ -2850,7 +2954,8 @@ class TestMainWindowInteractions:
             "cover": "https://example.com/cover.jpg",
         }
 
-        for _ in range(module._MAX_THUMBNAIL_THREADS + 5):
+        for index in range(module._MAX_THUMBNAIL_THREADS + 5):
+            meta["cover"] = f"https://example.com/cover-{index}.jpg"
             win.update_song_META(meta)
 
         active = [

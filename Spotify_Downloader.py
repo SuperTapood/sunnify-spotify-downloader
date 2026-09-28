@@ -28,6 +28,7 @@ import logging
 import os
 import platform
 import re
+import shutil
 import signal
 import sys
 import threading
@@ -59,12 +60,14 @@ from PyQt6.QtWidgets import (
     QFileDialog,
     QGraphicsDropShadowEffect,
     QHBoxLayout,
+    QInputDialog,
     QMainWindow,
     QMessageBox,
     QPushButton,
     QVBoxLayout,
 )
 from yt_dlp import YoutubeDL
+from yt_dlp.cookies import CookieLoadError
 
 from spotifydown_api import (
     ContentUnavailableError,
@@ -77,6 +80,7 @@ from spotifydown_api import (
     cap_filename,
     detect_spotify_url_type,
     extract_playlist_id,
+    parse_spotify_urls,
     sanitize_filename,
 )
 from Template import Ui_MainWindow
@@ -294,6 +298,15 @@ SETTINGS = (
         scraper_kwarg="include_track_number",
         cli_flag="--track-numbers",
         help="prefix filenames with playlist position",
+    ),
+    _Setting(
+        "download_workers",
+        "4",
+        "choice",
+        ("1", "2", "4", "6", "8"),
+        scraper_kwarg="download_workers",
+        cli_flag="--workers",
+        help="simultaneous downloads (4 by default; up to 8 for faster connections)",
     ),
     _Setting(
         "artist_first",
@@ -640,6 +653,7 @@ class MusicScraper(QThread):
     song_meta = pyqtSignal(dict)
     add_song_meta = pyqtSignal(dict)
     count_updated = pyqtSignal(int)
+    progress_snapshot = pyqtSignal(dict)
     dlprogress_signal = pyqtSignal(int)
     Resetprogress_signal = pyqtSignal(int)
     resume_skipped = pyqtSignal(int)  # manifest-resumed tracks never reach song_meta
@@ -648,6 +662,25 @@ class MusicScraper(QThread):
     # Max concurrent track downloads. 4 is the measured sweet spot:
     # linear speedup through 4, diminishing returns past 6 (CPU-bound ffmpeg).
     MAX_WORKERS = 4
+
+    def _youtube_dl(self, options):
+        """Use Firefox cookies by default; continue anonymously if unavailable."""
+        opts = dict(options)
+        if not getattr(self, "_firefox_cookies_unavailable", False):
+            opts["cookiesfrombrowser"] = ("firefox",)
+        ydl = YoutubeDL(opts)
+        if "cookiesfrombrowser" in opts:
+            try:
+                # yt-dlp loads browser cookies lazily. Check now so a missing
+                # profile does not turn every search into a track failure.
+                getattr(ydl, "cookiejar", None)
+            except CookieLoadError:
+                self._firefox_cookies_unavailable = True
+                log.warning("Firefox cookies unavailable; continuing without browser cookies")
+                ydl.close()
+                opts.pop("cookiesfrombrowser")
+                ydl = YoutubeDL(opts)
+        return ydl
 
     def __init__(
         self,
@@ -661,9 +694,13 @@ class MusicScraper(QThread):
         sample_rate: str = "auto",
         loose_match: bool = False,
         write_metadata: bool = False,
+        download_workers: str = "4",
     ):
         super().__init__()
         self.counter = 0  # Initialize counter to zero
+        self.MAX_WORKERS = (
+            int(download_workers) if download_workers in ("1", "2", "4", "6", "8") else 4
+        )
         self.session = requests.Session()
         self.spotifydown_api = None
         self._cancel_event = cancel_event or threading.Event()
@@ -684,7 +721,16 @@ class MusicScraper(QThread):
         # enables this unconditionally. Writing inside the bounded download
         # workers guarantees completion before a run is reported finished.
         self.write_metadata = bool(write_metadata)
-        self._counter_lock = threading.Lock()
+        self._counter_lock = threading.RLock()
+        self._queue_counts = {"downloaded": 0, "skipped": 0, "failed": 0, "reused": 0}
+        self._queue_active = False
+        self._url_index = 1
+        self._url_count = 1
+        self._progress_revision = 0
+        self._preview_serial = 0
+        self._current_resumed = 0
+        self._total_known = False
+        self._completed_audio: dict[tuple, str] = {}
         self._failed_lock = threading.Lock()
         self._filename_lock = threading.Lock()
         self._manifest_lock = threading.Lock()
@@ -701,6 +747,80 @@ class MusicScraper(QThread):
         # that only makes sense for a single active download.
         self._parallel_mode = False
         self._total_tracks = 0
+
+    def begin_queue(self, url_count: int) -> None:
+        with self._counter_lock:
+            self._queue_active = True
+            self._queue_counts = dict.fromkeys(self._queue_counts, 0)
+            self._url_count = url_count
+            self._completed_audio.clear()
+
+    def begin_url(self, index: int) -> None:
+        with self._counter_lock:
+            self._url_index = index
+            self.counter = 0
+            self._current_resumed = 0
+            self._total_known = False
+            self._emit_progress_snapshot()
+
+    def _emit_progress_snapshot(self) -> None:
+        """Called under _counter_lock: UI reads this snapshot, never mutable state."""
+        self._progress_revision += 1
+        self.progress_snapshot.emit(
+            {
+                **self._queue_counts,
+                "revision": self._progress_revision,
+                "url_index": self._url_index,
+                "url_count": self._url_count,
+                "processed": self.counter + self._current_resumed,
+                "total": self._total_tracks + self._current_resumed if self._total_known else None,
+            }
+        )
+
+    def _set_total_tracks(self, total: int) -> None:
+        with self._counter_lock:
+            self._total_tracks = total
+            self._total_known = True
+            self._emit_progress_snapshot()
+
+    def _emit_song_meta(self, meta: dict) -> None:
+        with self._counter_lock:
+            self._preview_serial += 1
+            self.song_meta.emit(
+                {**meta, "_preview_id": self._preview_serial, "_url_index": self._url_index}
+            )
+
+    def _reuse_audio(self, track_id: str, destination: str) -> bool:
+        with self._counter_lock:
+            source = self._completed_audio.get(self._audio_cache_key(track_id))
+        if not source or not os.path.isfile(source):
+            return False
+        # Copy, never hard-link: writing tags for this collection must not
+        # modify a previously downloaded collection's artwork/track numbers.
+        try:
+            if os.path.abspath(source) != os.path.abspath(destination):
+                shutil.copyfile(source, destination)
+        except OSError:
+            log.debug("could not reuse downloaded track %s", track_id, exc_info=True)
+            # A partial copy must not be mistaken for a finished download.
+            with contextlib.suppress(OSError):
+                if os.path.abspath(source) != os.path.abspath(destination):
+                    os.remove(destination)
+            return False
+        with self._counter_lock:
+            self._queue_counts["reused"] += 1
+        return True
+
+    def _remember_audio(self, track_id: str, path: str) -> None:
+        # Only register audio produced by this run. Existing files and old
+        # manifests don't establish their bitrate or sample rate, so copying
+        # them into another collection could silently lower output quality.
+        if track_id:
+            with self._counter_lock:
+                self._completed_audio[self._audio_cache_key(track_id)] = path
+
+    def _audio_cache_key(self, track_id: str) -> tuple:
+        return track_id, self.audio_format, self.audio_quality, self.sample_rate
 
     def is_cancelled(self) -> bool:
         """Check if cancellation has been requested."""
@@ -756,7 +876,7 @@ class MusicScraper(QThread):
             # PlaylistClient owns thread-local connection pools. Passing this
             # scraper's legacy Session would force four enrichment workers to
             # share one requests.Session, which is not thread-safe.
-            self.spotifydown_api = PlaylistClient()
+            self.spotifydown_api = PlaylistClient(cancel_event=self._cancel_event)
         return self.spotifydown_api
 
     def close(self) -> None:
@@ -1468,6 +1588,7 @@ class MusicScraper(QThread):
         expected_title=None,
         expected_artists=None,
         expected_album=None,
+        excluded_video_urls=None,
     ):
         """Return the best YouTube watch URL for a search, or None.
 
@@ -1526,7 +1647,7 @@ class MusicScraper(QThread):
             if self.is_cancelled() or self._youtube_is_blocked():
                 return None
             try:
-                with YoutubeDL(select_opts) as ydl:
+                with self._youtube_dl(select_opts) as ydl:
                     info = ydl.extract_info(query, download=False)
             except Exception as exc:
                 # A real exception here (bot-challenge, SSL, network, region
@@ -1539,7 +1660,13 @@ class MusicScraper(QThread):
                 )
                 self._note_if_network_blocked(str(exc))
                 return None
-            found = [e for e in (info or {}).get("entries", []) if e and e.get("id")]
+            found = [
+                e
+                for e in (info or {}).get("entries", [])
+                if e
+                and e.get("id")
+                and f"https://www.youtube.com/watch?v={e['id']}" not in (excluded_video_urls or ())
+            ]
             log.debug("yt search returned %d entries for %r", len(found), query)
             return found
 
@@ -1557,7 +1684,7 @@ class MusicScraper(QThread):
             hydrate_opts["noplaylist"] = True
             video_url = f"https://www.youtube.com/watch?v={entry['id']}"
             try:
-                with YoutubeDL(hydrate_opts) as ydl:
+                with self._youtube_dl(hydrate_opts) as ydl:
                     hydrated = ydl.extract_info(video_url, download=False)
             except Exception as exc:
                 log.debug(
@@ -2087,53 +2214,56 @@ class MusicScraper(QThread):
                 raise InterruptedError("download cancelled")
             if self._youtube_is_blocked():
                 raise RuntimeError("YouTube blocked this network with a bot check")
-            video_url = self._select_youtube_match(
-                query,
-                expected_duration_s,
-                expected_title=expected_title,
-                expected_artists=expected_artists,
-                expected_album=expected_album,
-            )
-            if not video_url or video_url in attempted_video_urls:
-                continue
-            attempted_video_urls.add(video_url)
-            for label, opts in attempts:
-                if self.is_cancelled():
-                    raise InterruptedError("download cancelled")
-                if self._youtube_is_blocked():
-                    raise RuntimeError("YouTube blocked this network with a bot check")
-                # per-attempt bridge captures yt-dlp's own error even when
-                # ignoreerrors swallows it (no exception, no file)
-                ytlog = _YtdlpLog()
-                try:
-                    with YoutubeDL({**opts, "logger": ytlog}) as ydl:
-                        ydl.extract_info(video_url, download=True)
-                except Exception as exc:
-                    log.warning(
-                        "download attempt (%s) failed for %s: %s",
-                        label,
-                        video_url,
-                        str(exc)[:300],
-                    )
-                    self._note_if_network_blocked(str(exc))
+            # A selected video can be unavailable or return 403 even though a
+            # second title/artist/duration-matched search result is playable.
+            # Bound retries so a large playlist cannot spend indefinitely on
+            # one track when YouTube blocks every result.
+            while len(attempted_video_urls) < 3:
+                video_url = self._select_youtube_match(
+                    query,
+                    expected_duration_s,
+                    expected_title=expected_title,
+                    expected_artists=expected_artists,
+                    expected_album=expected_album,
+                    excluded_video_urls=attempted_video_urls,
+                )
+                if not video_url or video_url in attempted_video_urls:
+                    break
+                attempted_video_urls.add(video_url)
+                for label, opts in attempts:
                     if self.is_cancelled():
-                        raise InterruptedError("download cancelled") from exc
-                else:
-                    if not os.path.exists(expected_path):
-                        # the silent case: yt-dlp produced no file without
-                        # raising; the bridge holds the real reason
-                        reason = (ytlog.last_error or "no error reported by yt-dlp").strip()
+                        raise InterruptedError("download cancelled")
+                    if self._youtube_is_blocked():
+                        raise RuntimeError("YouTube blocked this network with a bot check")
+                    # Capture yt-dlp's error even when ignoreerrors swallows it.
+                    ytlog = _YtdlpLog()
+                    try:
+                        with self._youtube_dl({**opts, "logger": ytlog}) as ydl:
+                            ydl.extract_info(video_url, download=True)
+                    except Exception as exc:
                         log.warning(
-                            "download attempt (%s) produced no file for %s: %s",
+                            "download attempt (%s) failed for %s: %s",
                             label,
                             video_url,
-                            reason[:300],
+                            str(exc)[:300],
                         )
-                        self._note_if_network_blocked(reason)
-                if os.path.exists(expected_path):
-                    if label != "default":
-                        log.info("recovered via %s player clients", label)
-                    return expected_path
+                        self._note_if_network_blocked(str(exc))
+                        if self.is_cancelled():
+                            raise InterruptedError("download cancelled") from exc
+                    else:
+                        if not os.path.exists(expected_path):
+                            reason = (ytlog.last_error or "no error reported by yt-dlp").strip()
+                            log.warning(
+                                "download attempt (%s) produced no file for %s: %s",
+                                label,
+                                video_url,
+                                reason[:300],
+                            )
+                            self._note_if_network_blocked(reason)
+                    if os.path.exists(expected_path):
+                        if label != "default":
+                            log.info("recovered via %s player clients", label)
+                        return expected_path
 
         log.debug("no playable audio landed for query set %r", queries)
         raise RuntimeError("no playable audio source found on YouTube for this track")
@@ -2162,10 +2292,9 @@ class MusicScraper(QThread):
         Qt signals emitted here cross thread boundaries via queued connections,
         which is safe.
 
-        In parallel mode (self._parallel_mode), per-track UI noise (song_meta
-        preview, per-byte progress) is suppressed because those widgets are
-        single-track and would flicker with N workers in flight. add_song_meta
-        still fires so ID3 tags + cover art get written to every mp3.
+        In parallel mode, progress reports completed tracks. The preview
+        follows the latest track to start, with ordered metadata snapshots
+        keeping late worker events from replacing a newer preview.
 
         track_num (1-based) is passed through to song_meta so the ID3 TRCK
         frame can be populated for playlist ordering.
@@ -2206,6 +2335,10 @@ class MusicScraper(QThread):
                         release_date = enriched.release_date
                     if not album_name and enriched.album:
                         album_name = enriched.album
+            except InterruptedError:
+                if self.is_cancelled():
+                    return None
+                raise
             except SpotifyDownAPIError as exc:
                 log.debug("cover enrichment failed for '%s': %s", track_title, exc)
 
@@ -2258,25 +2391,29 @@ class MusicScraper(QThread):
         try:
             # Preview panel shows whichever track most recently started; the
             # worker race is fine (better than a blank panel).
-            self.song_meta.emit(dict(song_meta))
+            self._emit_song_meta(song_meta)
 
             if os.path.exists(filepath):
                 self._write_metadata_if_enabled(song_meta)
                 self._record_in_manifest(track.id, filepath)
                 self.add_song_meta.emit(song_meta)
-                self._finish_track_ui(ok=True)
+                self._finish_track_ui(ok=True, skipped=True)
                 return None
 
             search_query = f"ytsearch1:{track_title} {artists} audio"
             expected_dur = (track.duration_ms / 1000) if track.duration_ms else None
             try:
-                final_path = self.download_track_audio(
-                    search_query,
-                    filepath,
-                    expected_duration_s=expected_dur,
-                    expected_title=track_title,
-                    expected_artists=artists,
-                    expected_album=album_name,
+                final_path = (
+                    filepath
+                    if self._reuse_audio(track.id, filepath)
+                    else self.download_track_audio(
+                        search_query,
+                        filepath,
+                        expected_duration_s=expected_dur,
+                        expected_title=track_title,
+                        expected_artists=artists,
+                        expected_album=album_name,
+                    )
                 )
             except Exception as error_status:
                 if self.is_cancelled():
@@ -2306,6 +2443,7 @@ class MusicScraper(QThread):
             song_meta["file"] = final_path
             self._write_metadata_if_enabled(song_meta)
             self._record_in_manifest(track.id, final_path)
+            self._remember_audio(track.id, final_path)
             self.add_song_meta.emit(song_meta)
             self._finish_track_ui(ok=True)
             return None
@@ -2313,17 +2451,20 @@ class MusicScraper(QThread):
             with self._filename_lock:
                 self._in_flight_files.discard(filepath.casefold())
 
-    def _finish_track_ui(self, ok: bool) -> None:
+    def _finish_track_ui(self, ok: bool, skipped: bool = False) -> None:
         """Update counter + progress bar after a track completes or fails."""
-        current = self.increment_counter()
-        if self._parallel_mode and self._total_tracks > 0:
+        with self._counter_lock:
+            current = self.increment_counter(
+                "skipped" if skipped else "downloaded" if ok else "failed"
+            )
             # Aggregate progress across all workers: show how many tracks are
             # done as a percentage. Avoids the N-workers-jittering-one-bar
             # problem where per-byte emits from 4 downloads make the bar jump.
-            pct = int(current / self._total_tracks * 100)
-            self.dlprogress_signal.emit(min(pct, 100))
-        elif ok:
-            self.dlprogress_signal.emit(100)
+            if self._parallel_mode and self._total_tracks > 0:
+                pct = int(current / self._total_tracks * 100)
+                self.dlprogress_signal.emit(min(pct, 100))
+            elif ok:
+                self.dlprogress_signal.emit(100)
 
     def _load_manifest(self, folder: str) -> set:
         """Load the set of track IDs already downloaded into `folder`.
@@ -2393,11 +2534,15 @@ class MusicScraper(QThread):
                     log.warning("could not update resume manifest: %s", exc)
                     self._manifest_write_warned = True
 
-    def scrape_playlist(self, spotify_playlist_link, music_folder):
+    def _reset_download_state(self):
         # Reset mutable state so repeat invocations on the same scraper
         # instance don't carry stale counters or failure lists.
         with self._counter_lock:
             self.counter = 0
+            self._current_resumed = 0
+            self._total_known = False
+            if not self._queue_active:
+                self._queue_counts = dict.fromkeys(self._queue_counts, 0)
         with self._failed_lock:
             self._failed_tracks.clear()
             self._network_blocked = False
@@ -2405,13 +2550,18 @@ class MusicScraper(QThread):
             self._in_flight_files.clear()
         self._parallel_mode = False
         self._total_tracks = 0
+        self._manifest_path = None
+        self._manifest_owners.clear()
+        self._manifest_records.clear()
+        self._manifest_write_warned = False
 
-        # A playlist or an album both flow through here. detect_spotify_url_type
-        # returns ("playlist"|"album", id); albums reuse the same embed-parsing
-        # path with the album embed endpoint (closes #38).
+    def scrape_playlist(self, spotify_playlist_link, music_folder):
+        self._reset_download_state()
+
+        # All collections share download, numbering, and resume handling.
         content_type, playlist_id = detect_spotify_url_type(spotify_playlist_link)
-        if content_type not in ("playlist", "album"):
-            raise ValueError("Expected a playlist or album URL")
+        if content_type not in ("playlist", "album", "artist"):
+            raise ValueError("Expected a playlist, album, or artist URL")
         self.PlaylistID.emit(playlist_id)
 
         # Bail before network work if stop was already clicked.
@@ -2425,7 +2575,9 @@ class MusicScraper(QThread):
             raise RuntimeError(str(exc)) from exc
 
         metadata = spotify_api.get_playlist_metadata(playlist_id, content_type=content_type)
-        playlist_display_name = self.format_playlist_name(metadata)
+        playlist_display_name = (
+            metadata.name if content_type == "artist" else self.format_playlist_name(metadata)
+        )
         self.song_Album.emit(playlist_display_name)
 
         playlist_folder_path = self.prepare_playlist_folder(music_folder, playlist_display_name)
@@ -2435,6 +2587,9 @@ class MusicScraper(QThread):
         # playlist can be finished across multiple sessions (closes #40).
         already_done = self._load_manifest(playlist_folder_path)
         if already_done:
+            with self._counter_lock:
+                self._queue_counts["skipped"] += len(already_done)
+                self._current_resumed = len(already_done)
             self.resume_skipped.emit(len(already_done))
             self.error_signal.emit(
                 f"Resuming: skipping {len(already_done)} already-downloaded track(s)"
@@ -2469,12 +2624,10 @@ class MusicScraper(QThread):
             self.PlaylistCompleted.emit("Download cancelled")
             return
 
-        self._total_tracks = planned_tracks
+        self._set_total_tracks(planned_tracks)
         self.Resetprogress_signal.emit(0)
 
-        # Small playlists don't benefit from parallelism. Keep 1 worker for
-        # playlists under 3 tracks to preserve the single-track UI feel.
-        worker_count = 1 if planned_tracks < 3 else min(self.MAX_WORKERS, planned_tracks)
+        worker_count = max(1, min(self.MAX_WORKERS, planned_tracks))
         self._parallel_mode = worker_count > 1
 
         log.info(
@@ -2501,65 +2654,76 @@ class MusicScraper(QThread):
 
         scheduled = 0
         if worker_count == 1:
-            for idx, track in enumerate(tracks, start=1):
-                if self.is_cancelled():
-                    break
-                scheduled = idx
-                self._total_tracks = max(self._total_tracks, scheduled)
-                # Reset the per-track progress bar at the top of each iteration
-                # so the single-track UI behaves the way it always has.
-                self.Resetprogress_signal.emit(0)
-                self._download_one_track(
-                    track,
-                    playlist_folder_path,
-                    metadata.cover_url,
-                    track_num=_track_num_for(track, idx),
-                )
+            try:
+                for idx, track in enumerate(tracks, start=1):
+                    if self.is_cancelled():
+                        break
+                    scheduled = idx
+                    self._total_tracks = max(self._total_tracks, scheduled)
+                    # Reset the per-track progress bar for sequential downloads.
+                    self.Resetprogress_signal.emit(0)
+                    self._download_one_track(
+                        track,
+                        playlist_folder_path,
+                        metadata.cover_url,
+                        track_num=_track_num_for(track, idx),
+                    )
+            finally:
+                close_tracks = getattr(tracks, "close", None)
+                if close_tracks:
+                    close_tracks()
         else:
             try:
                 with concurrent.futures.ThreadPoolExecutor(max_workers=worker_count) as executor:
-                    futures = []
-                    for idx, track in enumerate(tracks, start=1):
-                        if self.is_cancelled() or self._youtube_is_blocked():
-                            break
-                        scheduled = idx
-                        futures.append(
-                            executor.submit(
+                    pending = {}
+
+                    def reap_completed():
+                        done, _ = concurrent.futures.wait(
+                            pending, timeout=0.1, return_when=concurrent.futures.FIRST_COMPLETED
+                        )
+                        for future in done:
+                            track = pending.pop(future)
+                            try:
+                                future.result()
+                            except Exception as exc:
+                                if self.is_cancelled():
+                                    continue
+                                log.error("unexpected worker error", exc_info=exc)
+                                self.error_signal.emit(f"Unexpected worker error: {exc}")
+                                with self._failed_lock:
+                                    self._failed_tracks.append(track.title)
+                                self._finish_track_ui(ok=False)
+
+                    try:
+                        for idx, track in enumerate(tracks, start=1):
+                            while len(pending) >= worker_count * 2 and not self.is_cancelled():
+                                reap_completed()
+                            if self.is_cancelled() or self._youtube_is_blocked():
+                                break
+                            scheduled = idx
+                            future = executor.submit(
                                 self._download_one_track,
                                 track,
                                 playlist_folder_path,
                                 metadata.cover_url,
                                 _track_num_for(track, idx),
                             )
-                        )
-                        if expected_total and scheduled % 10 == 0:
-                            self.error_signal.emit(
-                                f"Fetching track metadata ({scheduled} of {expected_remaining})..."
-                            )
-                    # Providers may omit unavailable rows despite advertising
-                    # a larger count. Final reporting uses what was scheduled.
-                    self._total_tracks = scheduled
-                    for future in concurrent.futures.as_completed(futures):
-                        if self.is_cancelled():
-                            # Cancel remaining futures that haven't started
-                            # yet. In-flight downloads check is_cancelled at
-                            # their own top and return early.
-                            for f in futures:
-                                f.cancel()
-                            break
-                        try:
-                            future.result()
-                        except Exception as exc:
-                            # _download_one_track handles its own errors; this is
-                            # only framework-level fallout (a worker crashed hard).
-                            log.error("unexpected worker error", exc_info=exc)
-                            self.error_signal.emit(f"Unexpected worker error: {exc}")
+                            pending[future] = track
+                        self._set_total_tracks(scheduled)
+                        while pending and not self.is_cancelled():
+                            reap_completed()
+                    finally:
+                        for future in pending:
+                            future.cancel()
+                        close_tracks = getattr(tracks, "close", None)
+                        if close_tracks:
+                            close_tracks()
             finally:
                 # Reset only after executor shutdown: in-flight workers that
                 # observed False mid-run would emit single-track UI signals.
                 self._parallel_mode = False
 
-        self._total_tracks = scheduled
+        self._set_total_tracks(scheduled)
 
         if self.is_cancelled():
             log.info("scrape cancelled by user (%d done before cancel)", self.counter)
@@ -2582,9 +2746,14 @@ class MusicScraper(QThread):
 
     def scrape_track(self, spotify_track_link, music_folder):
         """Download a single track from Spotify."""
+        self._reset_download_state()
+        if self.is_cancelled():
+            self.PlaylistCompleted.emit("Download cancelled")
+            return
         url_type, track_id = detect_spotify_url_type(spotify_track_link)
         if url_type != "track":
             raise ValueError("Expected a track URL")
+        self._set_total_tracks(1)
 
         try:
             spotify_api = self.ensure_spotifydown_api()
@@ -2628,12 +2797,12 @@ class MusicScraper(QThread):
             "trackNumber": 1,
         }
 
-        self.song_meta.emit(dict(song_meta))
+        self._emit_song_meta(song_meta)
 
         if os.path.exists(filepath):
             self._write_metadata_if_enabled(song_meta)
             self.add_song_meta.emit(song_meta)
-            self.increment_counter()
+            self.increment_counter("skipped")
             self.PlaylistCompleted.emit("Track already exists!")
             return
 
@@ -2641,21 +2810,29 @@ class MusicScraper(QThread):
         search_query = f"ytsearch1:{track_title} {artists} audio"
         expected_dur = (track.duration_ms / 1000) if track.duration_ms else None
         try:
-            final_path = self.download_track_audio(
-                search_query,
-                filepath,
-                expected_duration_s=expected_dur,
-                expected_title=track_title,
-                expected_artists=artists,
-                expected_album=album_name,
+            final_path = (
+                filepath
+                if self._reuse_audio(track.id, filepath)
+                else self.download_track_audio(
+                    search_query,
+                    filepath,
+                    expected_duration_s=expected_dur,
+                    expected_title=track_title,
+                    expected_artists=artists,
+                    expected_album=album_name,
+                )
             )
         except Exception as error_status:
+            if self.is_cancelled():
+                self.PlaylistCompleted.emit("Download cancelled")
+                return
             error_msg = self._get_user_friendly_error(error_status, track_title)
             log.error("single-track download failed: '%s'", track_title, exc_info=True)
             # record it: the CLI derives its failure count and exit code from
             # this list, and a silent single-track failure exited 0 with no file
             with self._failed_lock:
                 self._failed_tracks.append(track_title)
+            self.increment_counter("failed")
             self.PlaylistCompleted.emit(error_msg)
             return
 
@@ -2663,27 +2840,32 @@ class MusicScraper(QThread):
             log.warning("single-track produced no audio file: '%s'", track_title)
             with self._failed_lock:
                 self._failed_tracks.append(track_title)
+            self.increment_counter("failed")
             self.PlaylistCompleted.emit("Download failed - no audio file produced")
             return
 
         song_meta["file"] = final_path
         self._write_metadata_if_enabled(song_meta)
         self.add_song_meta.emit(song_meta)
+        self._remember_audio(track.id, final_path)
         self.increment_counter()
         self.dlprogress_signal.emit(100)
         self.PlaylistCompleted.emit("Download Complete!")
 
-    def increment_counter(self) -> int:
+    def increment_counter(self, outcome: str = "downloaded") -> int:
         with self._counter_lock:
             self.counter += 1
             current = self.counter
-        self.count_updated.emit(current)  # Emit the signal with the updated count
+            self._queue_counts[outcome] += 1
+            self.count_updated.emit(current)
+            self._emit_progress_snapshot()
         return current
 
 
 # Scraper Thread
 class ScraperThread(QThread):
     progress_update = pyqtSignal(str)
+    source_started = pyqtSignal(int, int)
 
     def __init__(
         self,
@@ -2706,13 +2888,39 @@ class ScraperThread(QThread):
     def run(self):
         self.progress_update.emit("Scraping started...")
         try:
-            # Detect URL type and handle accordingly
-            url_type, _ = detect_spotify_url_type(self.spotify_link)
-            if url_type == "track":
-                self.scraper.scrape_track(self.spotify_link, self.music_folder)
+            urls = parse_spotify_urls(self.spotify_link)
+            self.scraper.begin_queue(len(urls))
+            failed_urls = 0
+            for index, url in enumerate(urls, 1):
+                if self._cancel_event.is_set():
+                    break
+                self.scraper.begin_url(index)
+                self.source_started.emit(index, len(urls))
+                self.progress_update.emit(f"URL {index}/{len(urls)}: {url}")
+                try:
+                    url_type, _ = detect_spotify_url_type(url)
+                    if url_type == "track":
+                        self.scraper.scrape_track(url, self.music_folder)
+                    else:
+                        self.scraper.scrape_playlist(url, self.music_folder)
+                    if self.scraper._failed_tracks:
+                        failed_urls += 1
+                except Exception as exc:
+                    if self._cancel_event.is_set():
+                        break
+                    if len(urls) == 1:
+                        raise
+                    failed_urls += 1
+                    log.exception("scrape failed for %s", url)
+                    self.progress_update.emit(f"URL {index}/{len(urls)} failed: {exc}")
+            if self._cancel_event.is_set():
+                self.progress_update.emit("Download cancelled")
+            elif failed_urls:
+                self.progress_update.emit(
+                    f"Finished with failures in {failed_urls}/{len(urls)} URLs"
+                )
             else:
-                self.scraper.scrape_playlist(self.spotify_link, self.music_folder)
-            self.progress_update.emit("Scraping completed.")
+                self.progress_update.emit(f"Completed {len(urls)} URL(s).")
         except Exception as e:
             log.exception("scrape failed for %s", self.spotify_link)
             self.progress_update.emit(f"{e}")
@@ -2968,12 +3176,10 @@ class DownloadThumbnail(QThread):
         if data:
             self.thumbnail_ready.emit(data)
 
+    @pyqtSlot(bytes)
     def _update_ui(self, data):
         """Update UI from main thread via signal."""
-        pic = QImage()
-        pic.loadFromData(data)
-        self.main_UI.CoverImg.setPixmap(QPixmap(pic))
-        self.main_UI.CoverImg.show()
+        self.main_UI.apply_preview_cover(self.url, data)
 
 
 class SettingsDialog(QDialog):
@@ -2986,6 +3192,9 @@ class SettingsDialog(QDialog):
         # min width so long macOS paths fit; height is sized at the end once hints exist
         self.setMinimumWidth(560)
         self._config = dict(config)
+        self._workers_cb = QComboBox()
+        self._workers_cb.addItems(["1", "2", "4", "6", "8"])
+        self._workers_cb.setCurrentText(config.get("download_workers", "4"))
 
         from PyQt6.QtWidgets import QLabel, QLineEdit
 
@@ -3066,7 +3275,7 @@ class SettingsDialog(QDialog):
             (
                 "Download folder:",
                 folder_row,
-                "Each playlist or album becomes its own folder inside this directory.",
+                "Each playlist, album, or artist discography gets its own folder here.",
             ),
             (
                 "Audio format:",
@@ -3079,6 +3288,11 @@ class SettingsDialog(QDialog):
                 self._quality_cb,
                 "Applies to lossy formats only (mp3, m4a, opus). "
                 "320 kbps is the highest quality these formats support.",
+            ),
+            (
+                "Parallel downloads:",
+                self._workers_cb,
+                "4 is the default. Try 6 or 8 on a fast connection; reduce this if downloads are rate-limited.",
             ),
             (
                 "Track number in filename:",
@@ -3255,6 +3469,7 @@ class SettingsDialog(QDialog):
         self._filename_preview.setText(f"{prefix}{stem}.mp3")
 
     def result_config(self) -> dict:
+        self._config["download_workers"] = self._workers_cb.currentText()
         self._config["download_path"] = self._folder_label.text()
         self._config["format"] = self._format_cb.currentText()
         self._config["quality"] = self._quality_cb.currentText().split()[0]
@@ -3539,6 +3754,27 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         """MainWindow constructor"""
         super().__init__()
         self.setupUi(self)
+        self.PlaylistLink.setGeometry(20, 60, 200, 34)
+        self.PlaylistLink.setPlaceholderText("Paste Spotify URL(s)")
+        self.PlaylistLink.setToolTip("Separate URLs with spaces or commas, or use Multiple URLs.")
+        self.MultipleUrlsBtn = QPushButton("Multiple URLs…", self.frame)
+        self.MultipleUrlsBtn.setGeometry(20, 95, 130, 18)
+        self.MultipleUrlsBtn.setStyleSheet(
+            "QPushButton { border: none; color: #145c46; text-align: left; }"
+            "QPushButton:hover { text-decoration: underline; }"
+        )
+        self.MultipleUrlsBtn.clicked.connect(self.edit_multiple_urls)
+        self.OpenLogsBtn = QPushButton("Open logs", self.frame)
+        self.OpenLogsBtn.setGeometry(20, 370, 115, 28)
+        self.OpenLogsBtn.setToolTip(
+            "Open the current log in Notepad" if sys.platform == "win32" else "Open the current log"
+        )
+        self.OpenLogsBtn.clicked.connect(self.open_log_file)
+        self.label_10.hide()
+        self.horizontalLayoutWidget_4.setGeometry(20, 250, 280, 42)
+        self.CounterLabel.setWordWrap(True)
+        self.horizontalLayoutWidget_3.setGeometry(20, 300, 280, 60)
+        self.statusMsg.setWordWrap(True)
         # let the options row size to its content so "Add Meta Tags" isn't clipped
         # by the .ui's fixed-width container (varies with font/locale/dpi)
         self.horizontalLayoutWidget_5.adjustSize()
@@ -3550,6 +3786,13 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         self._active_threads = []  # Keep references to running threads to prevent GC crashes
         self._is_downloading = False  # Track download state for stop button
         self._cancel_event = threading.Event()  # Event for cooperative thread cancellation
+        self._preview_meta = {}
+        self._preview_id = 0
+        self._preview_source = 0
+        self._preview_cover_url = ""
+        self._displayed_cover_url = ""
+        self._last_progress_revision = 0
+        self._last_progress_snapshot = None
 
         self.SONGINFORMATION.setGraphicsEffect(
             QGraphicsDropShadowEffect(blurRadius=25, xOffset=2, yOffset=2)
@@ -3563,10 +3806,8 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         self.Select_Home.clicked.connect(self.Linkedin)
         self.SettingsBtn.clicked.connect(self.open_settings)
 
-        # No Album row: the unauthenticated embed endpoints never expose
-        # album name, and a missing row beats a permanently blank one.
-        self.label_8.hide()
-        self.AlbumText.hide()
+        self.label_8.show()
+        self.AlbumText.show()
 
         # check for a newer release in the background; fail-silent, shows a toast only if found
         self._update_thread = UpdateCheckThread(__version__)
@@ -3678,15 +3919,51 @@ class MainWindow(QMainWindow, Ui_MainWindow):
             self.statusMsg.setText("Settings saved")
 
     @pyqtSlot()
+    def open_log_file(self):
+        import subprocess
+
+        path = log_file_path()
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "a", encoding="utf-8"):
+                pass
+            for handler in log.handlers:
+                handler.flush()
+            if sys.platform == "win32":
+                subprocess.Popen(["notepad.exe", path])
+            else:
+                from PyQt6.QtCore import QUrl
+                from PyQt6.QtGui import QDesktopServices
+
+                if not QDesktopServices.openUrl(QUrl.fromLocalFile(path)):
+                    raise OSError("No application could open the log file")
+        except OSError as exc:
+            self.statusMsg.setText(f"Could not open logs: {exc}")
+            log.warning("could not open log file: %s", exc)
+
+    @pyqtSlot()
+    def edit_multiple_urls(self):
+        current = "\n".join(filter(None, re.split(r"[\s,]+", self.PlaylistLink.text())))
+        text, accepted = QInputDialog.getMultiLineText(
+            self,
+            "Multiple Spotify URLs",
+            "One URL per line (artists, albums, playlists, or tracks):",
+            current,
+        )
+        if accepted:
+            self.PlaylistLink.setText(" ".join(text.split()))
+
+    @pyqtSlot()
     def on_returnButton(self):
         # If already downloading, stop the download
         if self._is_downloading:
             self._stop_download()
             return
 
-        spotify_url = self.PlaylistLink.text().strip()
-        if not spotify_url:
-            self.statusMsg.setText("Please enter a Spotify URL")
+        try:
+            spotify_urls = parse_spotify_urls(self.PlaylistLink.text())
+        except ValueError as exc:
+            self.statusMsg.setText(str(exc))
             return
 
         # ALWAYS prompt for download location on first download
@@ -3708,38 +3985,35 @@ class MainWindow(QMainWindow, Ui_MainWindow):
                 return
 
         try:
-            # Validate URL type
-            url_type, _ = detect_spotify_url_type(spotify_url)
-            self.statusMsg.setText(f"Detected: {url_type}")
+            self.statusMsg.setText(f"Queued {len(spotify_urls)} URL(s)")
 
             # Reset cancel event and set downloading state
             self._cancel_event = threading.Event()
             self._is_downloading = True
             self.DownloadBtn.setText("Stop")
+            self._preview_id = 0
+            self._preview_source = 0
+            self._last_progress_revision = 0
+            self._last_progress_snapshot = None
 
             self.scraper_thread = ScraperThread(
-                spotify_url,
+                spotify_urls,
                 self.download_path,
                 cancel_event=self._cancel_event,
                 write_metadata=self.AddMetaDataCheck.isChecked(),
                 **scraper_kwargs_from(self._config),
             )
             self.scraper_thread.progress_update.connect(self.update_progress)
+            self.scraper_thread.source_started.connect(self.preview_source_started)
             self.scraper_thread.finished.connect(self.thread_finished)
             self.scraper_thread.scraper.song_Album.connect(self.update_AlbumName)
             self.scraper_thread.scraper.song_meta.connect(self.update_song_META)
             self.scraper_thread.scraper.add_song_meta.connect(self.add_song_META)
-            self.scraper_thread.scraper.dlprogress_signal.connect(self.update_song_progress)
-            self.scraper_thread.scraper.Resetprogress_signal.connect(self.Reset_song_progress)
+            self.scraper_thread.scraper.progress_snapshot.connect(self.update_queue_progress)
             self.scraper_thread.scraper.PlaylistCompleted.connect(
                 lambda x: self.statusMsg.setText(x)
             )
             self.scraper_thread.scraper.error_signal.connect(lambda x: self.statusMsg.setText(x))
-
-            # Connect the count_updated signal to the update_counter slot
-            self.scraper_thread.scraper.count_updated.connect(self.update_counter)
-            # after update_counter so the label reads "1" before the prompt opens
-            self.scraper_thread.scraper.count_updated.connect(self._maybe_show_star_prompt)
 
             self.scraper_thread.start()
 
@@ -3774,30 +4048,96 @@ class MainWindow(QMainWindow, Ui_MainWindow):
     @pyqtSlot(dict)
     def update_song_META(self, song_meta):
         """Update UI with current track info (called BEFORE download starts)."""
-        if self.showPreviewCheck.isChecked():
-            cover_url = song_meta.get("cover", "")
-            active_thumbnails = sum(
-                isinstance(thread, DownloadThumbnail) for thread in self._active_threads
-            )
-            if cover_url and active_thumbnails < _MAX_THUMBNAIL_THREADS:
-                thumb_thread = DownloadThumbnail(cover_url, self)
-                self._active_threads.append(thumb_thread)
-                thumb_thread.finished.connect(lambda: self._cleanup_thread(thumb_thread))
-                thumb_thread.start()
-            artists_full = song_meta.get("artists", "")
-            artist_list = [a.strip() for a in artists_full.split(",") if a.strip()]
-            if len(artist_list) > 2:
-                artists_display = f"{artist_list[0]}, {artist_list[1]} +{len(artist_list) - 2}"
-            else:
-                artists_display = artists_full
-            self.ArtistNameText.setText(artists_display)
-            self.ArtistNameText.setToolTip(artists_full)
-            self.AlbumText.setText(song_meta.get("album", ""))
-            self.SongName.setText(song_meta.get("title", ""))
-            self.YearText.setText(song_meta.get("releaseDate", ""))
-
+        preview_id = song_meta.get("_preview_id", self._preview_id)
+        source = song_meta.get("_url_index", self._preview_source)
+        if preview_id < self._preview_id or source < self._preview_source:
+            return
+        self._preview_id = preview_id
+        self._preview_source = source
+        self._preview_meta = dict(song_meta)
+        cover_url = song_meta.get("cover", "")
+        if cover_url != self._preview_cover_url:
+            self.CoverImg.clear()
+            self._displayed_cover_url = ""
+        self._preview_cover_url = cover_url
+        self._start_preview_thumbnail()
+        artists_full = song_meta.get("artists", "")
+        artist_list = [a.strip() for a in artists_full.split(",") if a.strip()]
+        artists_display = (
+            f"{artist_list[0]}, {artist_list[1]} +{len(artist_list) - 2}"
+            if len(artist_list) > 2
+            else artists_full
+        )
+        self.ArtistNameText.setText(artists_display)
+        self.ArtistNameText.setToolTip(artists_full)
+        self.AlbumText.setText(song_meta.get("album", ""))
+        self.SongName.setText(song_meta.get("title", ""))
+        self.YearText.setText(song_meta.get("releaseDate", ""))
         self.MainSongName.setText(song_meta.get("title", "") + " - " + song_meta.get("artists", ""))
-        # NOTE: Meta tags are written in add_song_META (after file exists), not here
+
+    @pyqtSlot(int, int)
+    def preview_source_started(self, index, total):
+        if index < self._preview_source:
+            return
+        self._preview_source = index
+        self._preview_meta = {}
+        self._preview_cover_url = ""
+        self._displayed_cover_url = ""
+        for widget in (
+            self.CoverImg,
+            self.ArtistNameText,
+            self.AlbumText,
+            self.SongName,
+            self.YearText,
+            self.MainSongName,
+        ):
+            widget.clear()
+        self.AlbumName.setText(f"URL {index}/{total}: loading metadata…")
+
+    def _start_preview_thumbnail(self):
+        url = self._preview_cover_url
+        if not url or not self.showPreviewCheck.isChecked() or url == self._displayed_cover_url:
+            return
+        active = [
+            thread for thread in self._active_threads if isinstance(thread, DownloadThumbnail)
+        ]
+        if len(active) >= _MAX_THUMBNAIL_THREADS or any(thread.url == url for thread in active):
+            return
+        thread = DownloadThumbnail(url, self)
+        self._active_threads.append(thread)
+        thread.finished.connect(lambda: self._cleanup_thread(thread))
+        thread.start()
+
+    def apply_preview_cover(self, url, data):
+        if url != self._preview_cover_url:
+            return
+        pic = QImage()
+        if pic.loadFromData(data):
+            self.CoverImg.setPixmap(QPixmap.fromImage(pic))
+            self._displayed_cover_url = url
+
+    @pyqtSlot(dict)
+    def update_queue_progress(self, snapshot):
+        if snapshot["revision"] <= self._last_progress_revision:
+            return
+        self._last_progress_revision = snapshot["revision"]
+        self._last_progress_snapshot = dict(snapshot)
+        saved, skipped, failed = (snapshot[key] for key in ("downloaded", "skipped", "failed"))
+        total = snapshot["total"]
+        current = (
+            f"{snapshot['processed']}/{total} tracks" if total is not None else "loading metadata"
+        )
+        self.CounterLabel.setText(
+            f"{saved} saved · {skipped} skipped · {failed} failed\n"
+            f"URL {snapshot['url_index']}/{snapshot['url_count']} · {current}"
+        )
+        self.CounterLabel.setToolTip(
+            f"Totals across the entire queue.\n{snapshot['reused']} saved files reused audio from an earlier URL."
+        )
+        progress = min(100, int(snapshot["processed"] / total * 100)) if total else 0
+        self.update_song_progress(progress)
+        if saved > 0:
+            self._maybe_show_star_prompt(saved)
 
     @pyqtSlot(dict)
     def add_song_META(self, song_meta):
@@ -3816,10 +4156,14 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         """Remove finished thread from active list."""
         if thread in self._active_threads:
             self._active_threads.remove(thread)
+        if isinstance(thread, DownloadThumbnail) and thread.url != self._preview_cover_url:
+            # A full thumbnail pool must not drop the newest requested cover.
+            self._start_preview_thumbnail()
 
     @pyqtSlot(str)
     def update_AlbumName(self, AlbumName):
-        self.AlbumName.setText("Playlist Name : " + AlbumName)
+        self.AlbumName.setText(AlbumName)
+        self.AlbumName.setToolTip(AlbumName)
 
     @pyqtSlot(int)
     def update_counter(self, count):
@@ -3881,6 +4225,7 @@ class MainWindow(QMainWindow, Ui_MainWindow):
     def show_preview(self, state):
         if state == 2:  # 2 corresponds to checked state
             self.preview_window = self.OpenSongInformation()
+            self._start_preview_thumbnail()
         else:
             self.CloseSongInformation()
 

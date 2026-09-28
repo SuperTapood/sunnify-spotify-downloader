@@ -45,7 +45,7 @@ too.
 
 | Command | What it does |
 | :--- | :--- |
-| `sunnify download <url>` | Download a playlist, album, or track |
+| `sunnify download <url>` | Download a playlist, album, full artist discography, or track |
 | `sunnify info <url>` | Fetch metadata only (no downloads, no FFmpeg needed) |
 | `sunnify status [folder]` | Audio files present, manifest state, active download pid |
 | `sunnify config [--set k=v]` | Show or persist settings (the same `config.json` the GUI uses) |
@@ -58,8 +58,9 @@ instead of launching the app.
 ### download
 
 ```
-sunnify download <url> [--out DIR] [--format mp3|m4a|opus|flac|wav]
+sunnify download <url> [<url> ...] [--out DIR] [--format mp3|m4a|opus|flac|wav]
                        [--quality 128|192|256|320] [--sample-rate auto|44100|48000]
+                       [--workers 1|2|4|6|8]
                        [--track-numbers | --no-track-numbers]
                        [--artist-first | --no-artist-first]
                        [--title-only | --no-title-only]
@@ -70,16 +71,45 @@ sunnify download <url> [--out DIR] [--format mp3|m4a|opus|flac|wav]
 - Defaults come from your saved settings; flags override per run. `--help`
   always shows the current effective defaults.
 - Tracks already on disk are skipped, so re-running a playlist **resumes** it.
+- Four downloads run in parallel by default. Use `--workers 6` or `--workers 8`
+  on a fast connection; lower the setting if requests are rate-limited. Save a
+  default with `sunnify config --set download_workers=6` or in GUI Settings.
 - A per-folder pid lock stops two runs from racing the same destination.
 - First `Ctrl+C` finishes in-flight tracks and exits cleanly; a second one
   force-quits.
+
+Artist URLs download the artist's full catalog of albums, singles/EPs, and
+compilations into an `Artist - Discography` folder. Guest appearances on other
+artists' releases are excluded. Duplicate Spotify track IDs are downloaded once;
+different recordings or editions with different IDs remain separate. Normal
+links, locale-prefixed links, and `spotify:artist:` URIs all work, with no API keys.
+
+```bash
+sunnify download "https://open.spotify.com/artist/4Z8W4fKeB5YxbusRsdQVPb"
+sunnify info "spotify:artist:4Z8W4fKeB5YxbusRsdQVPb" --json
+```
+
+Pass multiple URLs to process a mixed queue in order with the same settings:
+
+```bash
+sunnify download "https://open.spotify.com/artist/..." "https://open.spotify.com/album/..." --out ./music
+sunnify info "spotify:playlist:..." "spotify:track:..." --json
+```
+
+Quoted lists separated by whitespace or commas also work. All inputs are validated
+before starting, and repeated links to the same Spotify resource are ignored.
+Each collection keeps its own folder; individual tracks go in the output folder.
+Tracks shared by multiple URLs reuse audio downloaded earlier in the same run,
+avoiding repeated searches and downloads while preserving separate files and tags.
+If one URL fails, later URLs are still processed and the command exits with code 1.
+Ctrl+C stops the remaining queue. Single-URL behavior is unchanged.
 
 ### Exit codes
 
 | Code | Meaning |
 | :--- | :--- |
 | `0` | Everything requested is on disk |
-| `1` | Run completed but some tracks failed or the run was stopped |
+| `1` | Some tracks or URLs failed, or the run was stopped |
 | `2` | Usage error (bad flag/argument) |
 | `3` | Environment or fatal error (bad URL, no FFmpeg, locked folder, ...) |
 
@@ -103,12 +133,19 @@ Errors are typed envelopes; branch on `code`, not on message text:
 ```
 
 Current codes: `invalid_url`, `conflicting_flags`, `out_dir_unusable`,
-`ffmpeg_missing`, `folder_locked`, `metadata_fetch_failed`, `run_failed`.
+`ffmpeg_missing`, `folder_locked`, `metadata_fetch_failed`, `run_failed`, `url_failed`.
 (`conflicting_flags` fires on explicit `--title-only --artist-first`; a
 title-only filename has no order, so pass one or the other.)
 
 `info`, `status`, `config`, and `doctor` print a single JSON document with
 `--json`.
+
+For multiple URLs, `download --json` uses `type: "batch"` and includes `urls`
+in `run_started`, emits `url_started` with `url`, `index`, and `total` for each
+queued URL, and aggregates track outcomes in `run_summary`. The summary also
+includes `failed_urls` for URLs that could not finish because of an error.
+`info --json` returns one document shaped as `{"items": [...], "errors": [...]}`;
+each item and error includes its source `url`. Single-URL JSON stays unchanged.
 
 ## For AI agents
 
@@ -130,6 +167,6 @@ This CLI is designed to be driven autonomously (per the
 | Thing | Location |
 | :--- | :--- |
 | Settings | One shared `config.json`: `sunnify config --set` and the GUI's settings panel read and write the same file, so a choice made in either face applies to both. Flags override it per run. |
-| Logs | Same rotating session log as the app (`sunnify doctor` shows the dir; "Open logs folder" in the GUI) |
+| Logs | Same rotating session log as the app. **Open logs** in the main window opens it in Notepad on Windows; Settings also has **Open logs folder**. `sunnify doctor` shows the directory. |
 | Resume manifest | `.sunnify-manifest.jsonl` inside each playlist folder |
 | Run lock | `.sunnify-cli.lock` inside the destination folder |

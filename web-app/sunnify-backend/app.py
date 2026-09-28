@@ -26,6 +26,7 @@ from spotifydown_api import (  # noqa: E402
     PlaylistClient,
     SpotifyDownAPIError,
     detect_spotify_url_type,
+    parse_spotify_urls,
 )
 
 app = Flask(__name__)
@@ -47,9 +48,58 @@ def get_playlist_client() -> PlaylistClient:
     return _playlist_client
 
 
+def _fetch_collection(client: PlaylistClient, spotify_url: str) -> tuple[str, list[dict]]:
+    url_type, item_id = detect_spotify_url_type(spotify_url)
+    tracks: list[dict] = []
+
+    if url_type == "track":
+        # Reuse the process-wide client and its pooled HTTP session instead
+        # of allocating an unclosed Session for every single-track request.
+        track = client.get_track(item_id)
+        tracks.append(
+            {
+                "id": track.spotify_id,
+                "title": track.title,
+                "artists": track.artists,
+                "album": track.album or "",
+                "cover": track.cover_url or "",
+                "releaseDate": track.release_date or "",
+                "downloadLink": "",  # No server-side downloads
+            }
+        )
+        playlist_name = f"{track.title} - {track.artists}"
+
+    else:
+        # Playlists, albums, and full artist discographies share the client.
+        metadata = client.get_playlist_metadata(item_id, content_type=url_type)
+        playlist_name = (
+            metadata.name
+            if url_type == "artist"
+            else f"{metadata.name} - {metadata.owner or 'Unknown'}"
+        )
+        playlist_cover = metadata.cover_url or ""
+
+        # Fetch tracks with memory-efficient iteration
+        for track in client.iter_playlist_tracks(item_id, content_type=url_type):
+            # Use track cover if available, otherwise fall back to playlist cover
+            cover = track.cover_url or playlist_cover
+            tracks.append(
+                {
+                    "id": track.spotify_id,
+                    "title": track.title,
+                    "artists": track.artists,
+                    "album": track.album or "",
+                    "cover": cover,
+                    "releaseDate": track.release_date or "",
+                    "downloadLink": "",  # No server-side downloads
+                }
+            )
+    return playlist_name, tracks
+
+
 @app.route("/api/scrape-playlist", methods=["POST"])
 def scrape_playlist():
-    """Fetch Spotify playlist/track metadata (no downloads).
+    """Fetch Spotify playlist/album/artist/track metadata (no downloads).
 
     This endpoint is optimized for free-tier hosting:
     - No file downloads (saves CPU/memory/disk)
@@ -66,69 +116,40 @@ def scrape_playlist():
         data = request.get_json(silent=True)
         if not isinstance(data, dict):
             return jsonify({"event": "error", "data": {"message": "Invalid JSON body"}}), 400
-        raw_url = data.get("playlistUrl", "")
-        if not isinstance(raw_url, str):
-            return jsonify({"event": "error", "data": {"message": "Invalid Spotify URL"}}), 400
-        spotify_url = raw_url.strip()
-
-        if not spotify_url:
+        raw_urls = data.get("playlistUrls", data.get("playlistUrl", ""))
+        if not raw_urls:
             return jsonify({"event": "error", "data": {"message": "No URL provided"}}), 400
-
-        # Only malformed input is a 400. ValueError raised later by Spotify
-        # parsing/conversion is a server-side failure and must not be
-        # misreported to the caller as a bad URL.
+        # Validate the entire queue before making any upstream requests.
         try:
-            url_type, item_id = detect_spotify_url_type(spotify_url)
+            urls = parse_spotify_urls(raw_urls)
         except ValueError:
             return jsonify({"event": "error", "data": {"message": "Invalid Spotify URL"}}), 400
 
-        if url_type == "unknown" or not item_id:
-            return (
-                jsonify({"event": "error", "data": {"message": "Invalid Spotify URL"}}),
-                400,
-            )
-
         client = get_playlist_client()
-        tracks: list[dict] = []
-
-        if url_type == "track":
-            # Reuse the process-wide client and its pooled HTTP session instead
-            # of allocating an unclosed Session for every single-track request.
-            track = client.get_track(item_id)
-            tracks.append(
-                {
-                    "id": track.spotify_id,
-                    "title": track.title,
-                    "artists": track.artists,
-                    "album": track.album or "",
-                    "cover": track.cover_url or "",
-                    "releaseDate": track.release_date or "",
-                    "downloadLink": "",  # No server-side downloads
-                }
-            )
-            playlist_name = f"{track.title} - {track.artists}"
-
-        else:
-            # Playlist or album (album reuses the same embed-parsing path).
-            metadata = client.get_playlist_metadata(item_id, content_type=url_type)
-            playlist_name = f"{metadata.name} - {metadata.owner or 'Unknown'}"
-            playlist_cover = metadata.cover_url or ""
-
-            # Fetch tracks with memory-efficient iteration
-            for track in client.iter_playlist_tracks(item_id, content_type=url_type):
-                # Use track cover if available, otherwise fall back to playlist cover
-                cover = track.cover_url or playlist_cover
-                tracks.append(
-                    {
-                        "id": track.spotify_id,
-                        "title": track.title,
-                        "artists": track.artists,
-                        "album": track.album or "",
-                        "cover": cover,
-                        "releaseDate": track.release_date or "",
-                        "downloadLink": "",  # No server-side downloads
-                    }
+        tracks = []
+        errors = []
+        names = []
+        seen = set()
+        for url in urls:
+            try:
+                name, collection_tracks = _fetch_collection(client, url)
+            except Exception as exc:
+                if len(urls) == 1:
+                    raise
+                app.logger.exception("metadata fetch failed for a URL in the batch")
+                message = (
+                    "Spotify API error"
+                    if isinstance(exc, SpotifyDownAPIError)
+                    else "Internal server error"
                 )
+                errors.append({"url": url, "message": message})
+                continue
+            names.append(name)
+            for track in collection_tracks:
+                if len(urls) == 1 or track["id"] not in seen:
+                    seen.add(track["id"])
+                    tracks.append(track)
+        playlist_name = names[0] if len(urls) == 1 else f"{len(names)} of {len(urls)} URLs"
 
         return jsonify(
             {
@@ -136,6 +157,7 @@ def scrape_playlist():
                 "data": {
                     "playlistName": playlist_name,
                     "tracks": tracks,
+                    **({"errors": errors} if len(urls) > 1 else {}),
                 },
             }
         )
@@ -167,7 +189,7 @@ def index():
             "mode": "metadata-only",
             "description": "Fetches Spotify metadata. For MP3 downloads, use the desktop app.",
             "endpoints": {
-                "POST /api/scrape-playlist": "Fetch playlist/track metadata",
+                "POST /api/scrape-playlist": "Fetch playlist/album/artist/track metadata",
                 "GET /api/health": "Health check",
             },
         }

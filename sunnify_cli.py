@@ -28,7 +28,7 @@ import uuid
 from typing import Any
 
 import Spotify_Downloader as app
-from spotifydown_api import PlaylistClient, SpotifyEmbedAPI
+from spotifydown_api import PlaylistClient, SpotifyEmbedAPI, parse_spotify_urls
 
 EXIT_OK = 0
 EXIT_PARTIAL = 1
@@ -107,7 +107,10 @@ class _Emitter:
 
     def _human(self, name: str, f: dict) -> None:
         if name == "run_started":
-            print(f"» {f['url']}  ->  {f['folder']}  [{f['format']}]", flush=True)
+            source = f"{len(f['urls'])} URLs" if f.get("type") == "batch" else f["url"]
+            print(f"» {source}  ->  {f['folder']}  [{f['format']}]", flush=True)
+        elif name == "url_started":
+            print(f"  [{f['index']}/{f['total']}] {f['url']}", flush=True)
         elif name == "track_done":
             print(f"  ✓ {os.path.basename(f['file'])}", flush=True)
         elif name == "track_skipped":
@@ -115,9 +118,12 @@ class _Emitter:
         elif name == "warning":
             print(f"  ! {f['message']}", flush=True)
         elif name == "run_summary":
+            url_failures = (
+                f", {len(f['failed_urls'])} URL(s) failed" if f.get("failed_urls") else ""
+            )
             print(
                 f"done: {f['landed']} landed, {f['skipped']} already present, "
-                f"{f['failed']} failed in {f['elapsed_s']}s -> {f['folder']}",
+                f"{f['failed']} failed{url_failures} in {f['elapsed_s']}s -> {f['folder']}",
                 flush=True,
             )
 
@@ -329,7 +335,7 @@ class _RunState:
         self._lock = threading.Lock()
 
     def on_resume_skipped(self, count: int) -> None:
-        self.resume_skipped = int(count)
+        self.resume_skipped += int(count)
 
     def on_song_meta(self, meta: dict) -> None:
         path = meta.get("file", "")
@@ -402,14 +408,12 @@ def cmd_download(args) -> int:
         return EXIT_USAGE
 
     try:
-        url_type, item_id = app.detect_spotify_url_type(args.url)
-    except ValueError:
-        url_type, item_id = "unknown", None
-    if url_type == "unknown" or not item_id:
+        urls = parse_spotify_urls(args.url)
+    except ValueError as exc:
         emitter.error(
-            f"not a spotify playlist/album/track url: {args.url}",
+            str(exc),
             code="invalid_url",
-            hint="expected https://open.spotify.com/{playlist,album,track}/... or a spotify: uri",
+            hint="expected https://open.spotify.com/{playlist,album,artist,track}/... or a spotify: uri",
         )
         return EXIT_FATAL
     try:
@@ -454,6 +458,7 @@ def cmd_download(args) -> int:
     try:
         cancel_event = threading.Event()
         scraper = _build_scraper(args, cfg, cancel_event)
+        scraper.begin_queue(len(urls))
         state = _RunState(emitter)
         # workers emit from pool threads; with no qt event loop running, queued
         # (auto) connections are never delivered, so force direct delivery
@@ -481,8 +486,8 @@ def cmd_download(args) -> int:
 
         emitter.event(
             "run_started",
-            url=args.url,
-            type=url_type,
+            url=urls[0],
+            type=app.detect_spotify_url_type(urls[0])[0] if len(urls) == 1 else "batch",
             folder=out_dir,
             format=scraper.audio_format,
             quality=scraper.audio_quality,
@@ -491,16 +496,36 @@ def cmd_download(args) -> int:
             title_only=scraper.title_only,
             track_numbers=scraper.include_track_number,
             loose_match=scraper.loose_match,
+            **({"urls": urls} if len(urls) > 1 else {}),
         )
         t0 = time.monotonic()
-        if url_type == "track":
-            scraper.scrape_track(args.url, out_dir)
-        else:
-            scraper.scrape_playlist(args.url, out_dir)
-
-        failed = list(scraper._failed_tracks)
+        failed = []
+        failed_urls = []
+        for index, url in enumerate(urls, 1):
+            if cancel_event.is_set():
+                break
+            url_type, _ = app.detect_spotify_url_type(url)
+            scraper.begin_url(index)
+            if len(urls) > 1:
+                emitter.event("url_started", url=url, index=index, total=len(urls), type=url_type)
+            # Clear failures before dispatch too: metadata errors can happen
+            # before the scraper has started a track or collection.
+            scraper._failed_tracks.clear()
+            try:
+                if url_type == "track":
+                    scraper.scrape_track(url, out_dir)
+                else:
+                    scraper.scrape_playlist(url, out_dir)
+            except Exception as exc:
+                if cancel_event.is_set():
+                    break
+                if len(urls) == 1:
+                    raise
+                failed_urls.append(url)
+                emitter.error(f"{url}: {exc}", code="url_failed")
+            failed.extend(scraper._failed_tracks)
         stopped = cancel_event.is_set()
-        code = EXIT_PARTIAL if (failed or stopped) else EXIT_OK
+        code = EXIT_PARTIAL if (failed or failed_urls or stopped) else EXIT_OK
         emitter.event(
             "run_summary",
             landed=len(state.landed),
@@ -511,6 +536,7 @@ def cmd_download(args) -> int:
             elapsed_s=round(time.monotonic() - t0, 1),
             folder=out_dir,
             exit_code=code,
+            **({"failed_urls": failed_urls} if len(urls) > 1 else {}),
         )
         if failed and not args.json:
             for title in failed:
@@ -528,76 +554,85 @@ def cmd_download(args) -> int:
         lock.release()
 
 
+def _fetch_info(url: str) -> dict[str, Any]:
+    url_type, item_id = app.detect_spotify_url_type(url)
+    if url_type == "track":
+        track_client = SpotifyEmbedAPI()
+        try:
+            track = track_client.get_track(item_id)
+        finally:
+            track_client.close()
+        payload = {
+            "type": "track",
+            "id": track.spotify_id,
+            "title": track.title,
+            "artists": track.artists,
+            "album": track.album or "",
+            "release_date": track.release_date or "",
+            "duration_ms": track.duration_ms or 0,
+        }
+    else:
+        client = PlaylistClient()
+        try:
+            meta = client.get_playlist_metadata(item_id, content_type=url_type)
+            tracks = [
+                {
+                    "id": t.spotify_id,
+                    "title": t.title,
+                    "artists": t.artists,
+                    "duration_ms": t.duration_ms or 0,
+                }
+                for t in client.iter_playlist_tracks(item_id, content_type=url_type)
+            ]
+        finally:
+            client.close()
+        payload = {
+            "type": url_type,
+            "id": item_id,
+            "name": meta.name,
+            "owner": meta.owner or "",
+            "track_count": len(tracks),
+            "tracks": tracks,
+        }
+    return payload
+
+
 def cmd_info(args) -> int:
     emitter = _Emitter(args.json)
-    payload: dict[str, Any]
     try:
-        url_type, item_id = app.detect_spotify_url_type(args.url)
-    except ValueError:
-        url_type, item_id = "unknown", None
-    if url_type == "unknown" or not item_id:
-        emitter.error(
-            f"not a spotify playlist/album/track url: {args.url}",
-            code="invalid_url",
-            hint="expected https://open.spotify.com/{playlist,album,track}/... or a spotify: uri",
-        )
+        urls = parse_spotify_urls(args.url)
+    except ValueError as exc:
+        emitter.error(str(exc), code="invalid_url")
         return EXIT_FATAL
-    try:
-        if url_type == "track":
-            track_client = SpotifyEmbedAPI()
-            try:
-                track = track_client.get_track(item_id)
-            finally:
-                track_client.close()
-            payload = {
-                "type": "track",
-                "id": track.spotify_id,
-                "title": track.title,
-                "artists": track.artists,
-                "album": track.album or "",
-                "release_date": track.release_date or "",
-                "duration_ms": track.duration_ms or 0,
-            }
-        else:
-            client = PlaylistClient()
-            try:
-                meta = client.get_playlist_metadata(item_id, content_type=url_type)
-                tracks = [
-                    {
-                        "id": t.spotify_id,
-                        "title": t.title,
-                        "artists": t.artists,
-                        "duration_ms": t.duration_ms or 0,
-                    }
-                    for t in client.iter_playlist_tracks(item_id, content_type=url_type)
-                ]
-            finally:
-                client.close()
-            payload = {
-                "type": url_type,
-                "id": item_id,
-                "name": meta.name,
-                "owner": meta.owner or "",
-                "track_count": len(tracks),
-                "tracks": tracks,
-            }
-    except Exception as exc:
-        emitter.error(
-            f"could not fetch metadata: {exc}",
-            code="metadata_fetch_failed",
-            hint="check the url is public and reachable; `sunnify doctor` tests upstream health",
-        )
-        return EXIT_FATAL
-
+    results = []
+    errors = []
+    for url in urls:
+        try:
+            payload = _fetch_info(url)
+        except Exception as exc:
+            if len(urls) == 1:
+                emitter.error(
+                    f"could not fetch metadata: {exc}",
+                    code="metadata_fetch_failed",
+                    hint="check the url is public and reachable; `sunnify doctor` tests upstream health",
+                )
+                return EXIT_FATAL
+            errors.append({"url": url, "message": str(exc)})
+            if not args.json:
+                emitter.error(f"{url}: {exc}", code="metadata_fetch_failed")
+            continue
+        results.append({"url": url, **payload} if len(urls) > 1 else payload)
+        if not args.json:
+            if payload["type"] == "track":
+                print(f"{payload['title']} - {payload['artists']}  [track]")
+            else:
+                print(f"{payload['name']}  [{payload['type']}, {payload['track_count']} tracks]")
+                for track in payload["tracks"]:
+                    print(f"  {track['title']} - {track['artists']}")
     if args.json:
-        print(json.dumps(payload, ensure_ascii=False, indent=2))
-    elif payload["type"] == "track":
-        print(f"{payload['title']} - {payload['artists']}  [track]")
-    else:
-        print(f"{payload['name']}  [{payload['type']}, {payload['track_count']} tracks]")
-        for t in payload["tracks"]:
-            print(f"  {t['title']} - {t['artists']}")
-    return EXIT_OK
+        output = results[0] if len(urls) == 1 else {"items": results, "errors": errors}
+        print(json.dumps(output, ensure_ascii=False, indent=2))
+    return EXIT_PARTIAL if errors else EXIT_OK
 
 
 def cmd_status(args) -> int:
@@ -752,7 +787,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="sunnify",
         description=(
-            "Sunnify headless CLI: download Spotify playlists, albums, and tracks "
+            "Sunnify headless CLI: download Spotify playlists, albums, artist discographies, and tracks "
             "as tagged local audio files. Same engine and settings as the desktop app."
         ),
         epilog=(
@@ -773,13 +808,18 @@ def build_parser() -> argparse.ArgumentParser:
 
     dl = sub.add_parser(
         "download",
-        help="download a playlist, album, or track",
+        help="download a playlist, album, artist discography, or track",
         description=(
-            "Download every track of a Spotify playlist/album, or a single track. "
+            "Download a Spotify playlist, album, full artist discography, or single track. "
             "Tracks already in the folder are skipped, so re-running resumes automatically."
         ),
     )
-    dl.add_argument("url", help="spotify playlist/album/track url (or spotify: uri)")
+    dl.add_argument(
+        "url",
+        nargs="+",
+        metavar="URL",
+        help="one or more Spotify playlist/album/artist/track URLs (or spotify: URIs)",
+    )
     dl.add_argument(
         "--out",
         "-o",
@@ -816,9 +856,9 @@ def build_parser() -> argparse.ArgumentParser:
     info = sub.add_parser(
         "info",
         help="fetch metadata without downloading",
-        description="Print playlist/album/track metadata. No downloads, no ffmpeg needed.",
+        description="Print playlist/album/artist/track metadata. No downloads, no ffmpeg needed.",
     )
-    info.add_argument("url", help="spotify playlist/album/track url")
+    info.add_argument("url", nargs="+", metavar="URL", help="one or more Spotify URLs")
     info.add_argument("--json", action="store_true", help="emit one JSON document")
     info.set_defaults(func=cmd_info)
 
