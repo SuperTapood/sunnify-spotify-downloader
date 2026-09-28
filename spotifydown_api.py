@@ -1,8 +1,9 @@
-"""Spotify playlist data fetcher with multiple fallback endpoints.
+"""Spotify collection data fetcher with multiple fallback endpoints.
 
 Primary: Embed page (/embed/playlist/{id}) - returns up to 100 tracks
 Fallback: spclient API - returns full track URIs for large playlists
 Individual: Track embed pages - for metadata on tracks beyond 100
+Artists: spclient catalogue metadata - full albums, singles/EPs and compilations
 
 All methods work without authentication by extracting anonymous tokens
 from Spotify's embed pages.
@@ -12,6 +13,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import functools
+import itertools
 import json
 import logging
 import re
@@ -19,9 +21,9 @@ import threading
 import time
 import unicodedata
 import weakref
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from collections.abc import Callable, Iterator, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, TypeVar
 
 import requests
@@ -154,17 +156,25 @@ class SpotifyEmbedAPI:
     _EMBED_PLAYLIST_URL = "https://open.spotify.com/embed/playlist/{playlist_id}"
     _EMBED_ALBUM_URL = "https://open.spotify.com/embed/album/{playlist_id}"
     _EMBED_TRACK_URL = "https://open.spotify.com/embed/track/{track_id}"
+    _EMBED_ARTIST_URL = "https://open.spotify.com/embed/artist/{artist_id}"
+    _CATALOG_URL = "https://spclient.wg.spotify.com/metadata/4/{kind}/{gid}"
     _TRACK_PAGE_URL = "https://open.spotify.com/track/{track_id}"
     _OEMBED_URL = "https://open.spotify.com/oembed"
     _SPCLIENT_URL = "https://spclient.wg.spotify.com/playlist/v2/playlist/{playlist_id}"
     _NEXT_DATA_PATTERN = re.compile(r'<script id="__NEXT_DATA__"[^>]*>([^<]+)</script>')
 
-    def __init__(self, *, session: requests.Session | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        session: requests.Session | None = None,
+        cancel_event: threading.Event | None = None,
+    ) -> None:
         # requests.Session is not documented as thread-safe. Per-track
         # enrichment runs concurrently, so sessions we create are pooled per
         # worker thread. An explicitly injected session stays untouched for
         # callers that provide a custom adapter or test double.
         self._session = session or requests.Session()
+        self._cancel_event = cancel_event
         self._session_is_injected = session is not None
         self._session_owner_thread = threading.get_ident()
         self._thread_local = threading.local()
@@ -176,6 +186,7 @@ class SpotifyEmbedAPI:
         self._metadata_pool: concurrent.futures.ThreadPoolExecutor | None = None
         self._cached_token: str | None = None
         self._token_expiry: float = 0
+        self._catalog_token_lock = threading.Lock()
         # Per-instance album cache (track_id -> album name or None). FIFO-
         # bounded at 256 entries. Used by `_fetch_track_album_from_page` so
         # re-downloading the same track in one session does not re-hit
@@ -190,6 +201,11 @@ class SpotifyEmbedAPI:
         self._snapshot_cache_lock = threading.Lock()
         self._collection_cache: OrderedDict[tuple[str, str], dict] = OrderedDict()
         self._spclient_cache: OrderedDict[str, dict] = OrderedDict()
+        self._track_cache: OrderedDict[str, tuple[float, TrackInfo]] = OrderedDict()
+
+    def _check_cancelled(self) -> None:
+        if self._cancel_event is not None and self._cancel_event.is_set():
+            raise InterruptedError("Download cancelled")
 
     def _remember_collection_snapshot(self, key: tuple[str, str], data: dict) -> None:
         with self._snapshot_cache_lock:
@@ -254,11 +270,13 @@ class SpotifyEmbedAPI:
         with self._snapshot_cache_lock:
             self._collection_cache.clear()
             self._spclient_cache.clear()
+            self._track_cache.clear()
         with self._album_cache_lock:
             self._album_cache.clear()
 
     def _fetch_spclient_data(self, playlist_id: str, timeout: int) -> dict | None:
         """Return a cached/full spclient snapshot, or None on a soft failure."""
+        self._check_cancelled()
         cached = self._take_spclient_snapshot(playlist_id)
         if cached is not None:
             return cached
@@ -317,6 +335,7 @@ class SpotifyEmbedAPI:
             RateLimitError: When rate limited by Spotify (retryable with backoff)
             ExtractionError: When page structure is unexpected (not retryable)
         """
+        self._check_cancelled()
         try:
             response = self._request_session().get(url, headers=self._headers(), timeout=30)
         except (requests.Timeout, requests.ConnectionError) as exc:
@@ -427,15 +446,192 @@ class SpotifyEmbedAPI:
             return self._EMBED_ALBUM_URL.format(playlist_id=content_id)
         return self._EMBED_PLAYLIST_URL.format(playlist_id=content_id)
 
+    def _catalog_token(self, artist_id: str, *, refresh: bool = False) -> str:
+        with self._catalog_token_lock:
+            if refresh or not self._cached_token or time.time() >= self._token_expiry - 60:
+                self._fetch_embed_data(self._EMBED_ARTIST_URL.format(artist_id=artist_id))
+            if not self._cached_token:
+                raise ExtractionError("Spotify did not provide an artist metadata access token")
+            return self._cached_token
+
+    @retry_on_network_error(exceptions=(NetworkError, RateLimitError))
+    def _fetch_catalog_metadata(self, kind: str, item_id: str, artist_id: str) -> dict:
+        """Read the complete catalogue using the embed's anonymous session.
+
+        Artist embeds only contain top tracks. The metadata service returns
+        all release groups and every disc of an album, without embed limits.
+        Refresh an expired token once; never silently return a partial catalogue.
+        """
+        self._check_cancelled()
+        url = self._CATALOG_URL.format(kind=kind, gid=_spotify_id_to_gid(item_id))
+        for attempt in range(2):
+            token = self._catalog_token(artist_id, refresh=bool(attempt))
+            try:
+                response = self._request_session().get(
+                    url,
+                    params={"market": "from_token"},
+                    headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
+                    timeout=30,
+                )
+            except (requests.Timeout, requests.ConnectionError) as exc:
+                raise NetworkError(f"Network error fetching {kind} metadata") from exc
+            except requests.RequestException as exc:
+                raise SpotifyDownAPIError(f"Failed to fetch {kind} metadata") from exc
+            if response.status_code == 401 and attempt == 0:
+                continue
+            if response.status_code == 429:
+                raise RateLimitError("Rate limited by Spotify - please wait before retrying")
+            if response.status_code in (401, 403, 404):
+                raise ContentUnavailableError(
+                    f"Spotify {kind} metadata is unavailable (HTTP {response.status_code})"
+                )
+            if response.status_code != 200:
+                raise NetworkError(f"Spotify {kind} metadata returned HTTP {response.status_code}")
+            try:
+                data = response.json()
+            except ValueError as exc:
+                raise ExtractionError(f"Invalid Spotify {kind} metadata JSON") from exc
+            if not isinstance(data, dict) or not data.get("name"):
+                raise ExtractionError(f"Invalid Spotify {kind} metadata")
+            return data
+        raise ContentUnavailableError("Spotify artist metadata session expired")
+
+    @staticmethod
+    def _catalog_items(data: dict, key: str) -> list[dict]:
+        items = data.get(key, [])
+        if not isinstance(items, list) or any(not isinstance(item, dict) for item in items):
+            raise ExtractionError(f"Invalid Spotify catalogue field: {key}")
+        return items
+
+    def _fetch_artist_discography(self, artist_id: str) -> dict:
+        artist = self._fetch_catalog_metadata("artist", artist_id, artist_id)
+        album_ids: dict[str, None] = {}
+        # These are the artist's own releases. appears_on_group contains other
+        # artists' releases and various-artist compilations, so is not included.
+        for key in ("album_group", "single_group", "compilation_group"):
+            for group in self._catalog_items(artist, key):
+                for album in self._catalog_items(group, "album"):
+                    album_ids[_gid_to_spotify_id(album.get("gid"))] = None
+
+        tracks: list[dict] = []
+        seen: set[str] = set()
+        albums = self._map_metadata(
+            lambda album_id: self._fetch_catalog_metadata("album", album_id, artist_id),
+            album_ids,
+        )
+        for album_id, album in zip(album_ids, albums, strict=True):
+            if "disc" not in album:
+                raise ExtractionError(f"Spotify album {album_id} has no disc listing")
+            for disc in self._catalog_items(album, "disc"):
+                for track in self._catalog_items(disc, "track"):
+                    track_id = _gid_to_spotify_id(track.get("gid"))
+                    if track_id in seen:
+                        continue
+                    seen.add(track_id)
+                    tracks.append({"id": track_id, "album": album})
+        return {"name": artist["name"], "tracks": tracks}
+
+    def _artist_track(self, entry: dict, artist_id: str, position: int) -> TrackInfo:
+        track = self._fetch_catalog_metadata("track", entry["id"], artist_id)
+        album = entry["album"]
+        date = album.get("date") or {}
+        release_date = None
+        if date.get("year"):
+            release_date = str(date["year"])
+            if date.get("month"):
+                release_date += f"-{int(date['month']):02d}"
+                if date.get("day"):
+                    release_date += f"-{int(date['day']):02d}"
+        images = self._catalog_items(album.get("cover_group") or {}, "image")
+        image = max(images, key=lambda img: img.get("width", 0), default={})
+        file_id = image.get("file_id")
+        info = TrackInfo(
+            id=entry["id"],
+            title=track["name"],
+            artists=", ".join(
+                a["name"] for a in self._catalog_items(track, "artist") if a.get("name")
+            ),
+            album=album["name"],
+            release_date=release_date,
+            cover_url=f"https://i.scdn.co/image/{file_id}" if file_id else None,
+            duration_ms=track.get("duration"),
+            preview_url=None,
+            raw=track,
+            position=position,
+        )
+        self._cache_track(info)
+        return info
+
+    def _map_metadata(self, fn: Callable[..., T], items) -> Iterator[T]:
+        """Keep workers fed with bounded lookahead, preserving source order.
+
+        Unlike fixed batches, a slow item doesn't prevent the next batch from
+        starting. Cancellation leaves at most eight requests, not a catalogue's
+        worth of queued work. Album/track numbering stays deterministic.
+        """
+        source = iter(items)
+        pool = self._get_metadata_pool()
+        pending: deque[concurrent.futures.Future[T]] = deque()
+        try:
+            for item in itertools.islice(source, 8):
+                self._check_cancelled()
+                pending.append(pool.submit(fn, item))
+            while pending:
+                self._check_cancelled()
+                result = pending.popleft().result()
+                for item in itertools.islice(source, 1):
+                    self._check_cancelled()
+                    pending.append(pool.submit(fn, item))
+                yield result
+        finally:
+            for future in pending:
+                future.cancel()
+
+    def _cache_track(self, track: TrackInfo) -> None:
+        with self._snapshot_cache_lock:
+            self._track_cache[track.id] = (
+                time.monotonic(),
+                replace(track, position=None, raw=dict(track.raw)),
+            )
+            self._track_cache.move_to_end(track.id)
+            while len(self._track_cache) > 512:
+                self._track_cache.popitem(last=False)
+
+    def _iter_artist_tracks(
+        self, artist_id: str, skip_ids: set[str] | frozenset[str]
+    ) -> Iterator[TrackInfo]:
+        data = self._take_collection_snapshot(("artist", artist_id))
+        if data is None:
+            data = self._fetch_artist_discography(artist_id)
+        pending = (
+            (pos, entry)
+            for pos, entry in enumerate(data["tracks"], 1)
+            if entry["id"] not in skip_ids
+        )
+        yield from self._map_metadata(
+            lambda item: self._artist_track(item[1], artist_id, item[0]), pending
+        )
+
     def get_playlist_metadata(
         self, playlist_id: str, content_type: str = "playlist"
     ) -> PlaylistInfo:
-        """Get playlist or album metadata from the embed page.
+        """Get playlist/album metadata or a complete artist discography.
 
         `content_type` is "playlist" (default) or "album". Albums skip the
         spclient track-count refinement because their full track list always
         fits in the embed payload.
+        Artists use the catalogue service to include all their releases.
         """
+        if content_type == "artist":
+            data = self._fetch_artist_discography(playlist_id)
+            self._remember_collection_snapshot((content_type, playlist_id), data)
+            return PlaylistInfo(
+                name=f"{data['name']} - Discography",
+                owner=None,
+                description="Albums, singles/EPs, and compilations released by this artist.",
+                cover_url=None,
+                track_count=len(data["tracks"]),
+            )
         url = self._embed_url_for(playlist_id, content_type)
         data = self._fetch_embed_data(url)
         self._remember_collection_snapshot((content_type, playlist_id), data)
@@ -485,9 +681,10 @@ class SpotifyEmbedAPI:
         content_type: str = "playlist",
         skip_ids: frozenset[str] | set[str] | None = None,
     ) -> Iterator[TrackInfo]:
-        """Iterate over playlist or album tracks.
+        """Iterate over playlist, album, or full artist discography tracks.
 
         `content_type` is "playlist" (default) or "album".
+        Use "artist" for unique tracks across albums, singles, and compilations.
 
         `skip_ids` is a set of Spotify track IDs already downloaded in a prior
         run. Matching tracks are skipped before any per-track metadata fetch,
@@ -503,6 +700,9 @@ class SpotifyEmbedAPI:
         can't provide) and skip the playlist-only spclient fallback.
         """
         skip_ids = skip_ids or frozenset()
+        if content_type == "artist":
+            yield from self._iter_artist_tracks(playlist_id, skip_ids)
+            return
         url = self._embed_url_for(playlist_id, content_type)
         cache_key = (content_type, playlist_id)
         data = self._take_collection_snapshot(cache_key)
@@ -588,32 +788,25 @@ class SpotifyEmbedAPI:
             if not pending:
                 return
 
-            # Fetch per-track metadata concurrently. On a 715-track playlist
-            # serialized fetches took ~3 minutes before the first track could
-            # download; with 8 workers it lands in ~20 seconds. Matches the
-            # streaming feel of pre-parallel versions without regressing the
-            # thread-safe generator contract: we yield from the caller's
-            # thread, the pool just speeds up the HTTP work.
-            #
-            # We yield in HTTP-completion order (not playlist order) so the
-            # downloader can start working on the first track that becomes
-            # available. The downloader uses TrackInfo.position to write the
-            # right number into the filename / TRCK tag, so this completion
-            # ordering is invisible in the final output.
-            # The client owns a persistent bounded pool. Reusing it keeps both
-            # worker threads and their thread-local HTTP sessions bounded when
-            # a long-running backend handles many playlists.
+            # Yield in completion order so a slow metadata request does not
+            # delay ready tracks. Keep only eight tasks in flight, reusing the
+            # client's worker sessions and track cache across queued URLs.
+            # Canonical positions preserve numbering despite completion order.
             pool = self._get_metadata_pool()
-            futures: list[concurrent.futures.Future[TrackInfo | None]] = []
+            remaining = iter(pending)
+            future_to_info = {}
             try:
-                future_to_info = {
-                    pool.submit(self._fetch_track_metadata, tid): (tid, uri) for tid, uri in pending
-                }
-                futures = list(future_to_info)
-                for future in concurrent.futures.as_completed(future_to_info):
-                    track_id, uri = future_to_info[future]
+                for tid, uri in itertools.islice(remaining, 8):
+                    self._check_cancelled()
+                    future_to_info[pool.submit(self.get_track, tid)] = (tid, uri)
+                while future_to_info:
+                    self._check_cancelled()
+                    future = next(iter(concurrent.futures.as_completed(future_to_info)))
+                    track_id, uri = future_to_info.pop(future)
                     try:
                         fetched_info = future.result()
+                    except InterruptedError:
+                        raise
                     except Exception:
                         fetched_info = None
                     if fetched_info is None:
@@ -629,11 +822,14 @@ class SpotifyEmbedAPI:
                             raw={"uri": uri},
                         )
                     fetched_info.position = position_map.get(track_id)
+                    for tid, next_uri in itertools.islice(remaining, 1):
+                        self._check_cancelled()
+                        future_to_info[pool.submit(self.get_track, tid)] = (tid, next_uri)
                     yield fetched_info
             finally:
                 # GeneratorExit/cancellation should not leave hundreds of this
                 # playlist's queued tasks consuming the shared pool later.
-                for future in futures:
+                for future in future_to_info:
                     future.cancel()
 
         except (requests.RequestException, ValueError, TypeError) as exc:
@@ -733,6 +929,7 @@ class SpotifyEmbedAPI:
             exceptions=(NetworkError, requests.Timeout, requests.ConnectionError),
         )
         def _go() -> str | None:
+            self._check_cancelled()
             url = self._TRACK_PAGE_URL.format(track_id=track_id)
             # Override only the user-agent; keep accept + accept-language
             # consistent with the embed fetches.
@@ -852,9 +1049,15 @@ class SpotifyEmbedAPI:
         Raises:
             SpotifyDownAPIError: If track cannot be fetched
         """
+        with self._snapshot_cache_lock:
+            cached = self._track_cache.get(track_id)
+            if cached is not None and time.monotonic() - cached[0] < 900:
+                self._track_cache.move_to_end(track_id)
+                return replace(cached[1], raw=dict(cached[1].raw))
         track_info = self._fetch_track_metadata(track_id)
         if track_info is None:
             raise SpotifyDownAPIError(f"Could not fetch track {track_id}")
+        self._cache_track(track_info)
         return track_info
 
 
@@ -928,8 +1131,9 @@ class PlaylistClient:
         *,
         session: requests.Session | None = None,
         base_urls: Sequence[str] | None = None,  # Ignored - kept for compatibility
+        cancel_event: threading.Event | None = None,
     ) -> None:
-        self._embed_api = SpotifyEmbedAPI(session=session)
+        self._embed_api = SpotifyEmbedAPI(session=session, cancel_event=cancel_event)
         # Compatibility attribute retained for callers that inspect/customize
         # the primary session. Worker calls are routed by SpotifyEmbedAPI.
         self._session = self._embed_api._session
@@ -941,7 +1145,7 @@ class PlaylistClient:
     def get_playlist_metadata(
         self, playlist_id: str, content_type: str = "playlist"
     ) -> PlaylistInfo:
-        """Get playlist or album metadata (`content_type`: playlist | album)."""
+        """Get collection metadata (`content_type`: playlist | album | artist)."""
         return self._embed_api.get_playlist_metadata(playlist_id, content_type=content_type)
 
     def iter_playlist_tracks(
@@ -950,7 +1154,7 @@ class PlaylistClient:
         content_type: str = "playlist",
         skip_ids: frozenset[str] | set[str] | None = None,
     ) -> Iterator[TrackInfo]:
-        """Iterate over all playlist or album tracks (`content_type`: playlist | album).
+        """Iterate over collection tracks (`content_type`: playlist | album | artist).
 
         For large playlists (>100 tracks), automatically uses fallback
         methods to retrieve complete track list. `skip_ids` omits tracks
@@ -1000,7 +1204,7 @@ class PlaylistClient:
 # Any trailing ?si=... query params are tolerated.
 _SPOTIFY_ID_RE = re.compile(
     r"(?:https?://open\.spotify\.com/(?:intl-[a-z]{2,}/)?|spotify:)"
-    r"(?P<type>playlist|track|album)[/:](?P<id>[a-zA-Z0-9]+)"
+    r"(?P<type>playlist|track|album|artist)[/:](?P<id>[a-zA-Z0-9]+)"
 )
 
 
@@ -1044,7 +1248,7 @@ def extract_album_id(url: str) -> str:
 
 
 def detect_spotify_url_type(url: str) -> tuple[str, str]:
-    """Detect whether the input is a playlist, album, or track and return (type, id).
+    """Detect a playlist, album, artist, or track and return (type, id).
 
     Accepts canonical `https://open.spotify.com/{type}/{id}` URLs, locale
     `/intl-xx/` prefixed URLs, and `spotify:{type}:{id}` URIs. Trailing query
@@ -1053,7 +1257,60 @@ def detect_spotify_url_type(url: str) -> tuple[str, str]:
     try:
         return _match_spotify(url)
     except ValueError as exc:
-        raise ValueError("Invalid Spotify URL. Must be a track, playlist, or album URL.") from exc
+        raise ValueError(
+            "Invalid Spotify URL. Must be a track, playlist, album, or artist URL."
+        ) from exc
+
+
+def parse_spotify_urls(value: str | Sequence[str]) -> list[str]:
+    """Validate a URL list and remove duplicate resources, preserving order.
+
+    Accept pasted lists separated by whitespace or commas, or CLI arguments.
+    Validate every token before any work so a typo cannot silently disappear.
+    """
+    entries = [value] if isinstance(value, str) else value
+    if not isinstance(entries, (list, tuple)) or any(not isinstance(v, str) for v in entries):
+        raise ValueError("Expected Spotify URLs as text or a list of strings.")
+    urls = []
+    seen = set()
+    for entry in entries:
+        for url in filter(None, re.split(r"[\s,]+", entry.strip())):
+            match = _SPOTIFY_ID_RE.match(url)
+            if not match or not re.fullmatch(r"/?(?:\?[^#\s]*)?(?:#[^\s]*)?", url[match.end() :]):
+                raise ValueError(f"Invalid Spotify URL: {url}")
+            resource = (match.group("type"), match.group("id"))
+            if resource not in seen:
+                seen.add(resource)
+                urls.append(url)
+    if not urls:
+        raise ValueError("Please enter at least one Spotify URL.")
+    return urls
+
+
+_BASE62 = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+
+
+def _spotify_id_to_gid(item_id: str) -> str:
+    """Convert Spotify's public base62 ID to the metadata service's hex ID."""
+    if not re.fullmatch(r"[a-zA-Z0-9]{22}", item_id):
+        raise ExtractionError("Invalid Spotify catalogue ID")
+    value = 0
+    for char in item_id:
+        value = value * 62 + _BASE62.index(char)
+    if value >= 1 << 128:
+        raise ExtractionError("Invalid Spotify catalogue ID")
+    return f"{value:032x}"
+
+
+def _gid_to_spotify_id(gid: str) -> str:
+    if not isinstance(gid, str) or not re.fullmatch(r"[a-fA-F0-9]{32}", gid):
+        raise ExtractionError("Invalid Spotify catalogue GID")
+    value = int(gid, 16)
+    result = ""
+    while value:
+        value, digit = divmod(value, 62)
+        result = _BASE62[digit] + result
+    return result.zfill(22)
 
 
 # Characters reserved on Windows (the strictest of our three target platforms;

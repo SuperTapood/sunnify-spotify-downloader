@@ -1,6 +1,6 @@
 # Sunnify Backend
 
-Lightweight Flask API that fetches Spotify playlist and track **metadata** (no audio). Powers the [web client](../sunnify-webclient); for actual MP3 downloads, use the desktop app or its bundled CLI.
+Lightweight Flask API that fetches Spotify playlist, album, artist discography, and track **metadata** (no audio). Powers the [web client](../sunnify-webclient); for actual MP3 downloads, use the desktop app or its bundled CLI.
 
 Optimized for free-tier hosting (512MB RAM, 0.1 CPU): a single reusable client, aggressive GC, metadata-only responses.
 
@@ -8,11 +8,18 @@ Optimized for free-tier hosting (512MB RAM, 0.1 CPU): a single reusable client, 
 
 | Method | Path | Purpose |
 | :--- | :--- | :--- |
-| `POST` | `/api/scrape-playlist` | Resolve a playlist/album/track URL to its track metadata |
+| `POST` | `/api/scrape-playlist` | Resolve a playlist/album/artist/track URL to its track metadata |
 | `GET` | `/api/health` | Liveness probe (`{"status":"ok"}`) |
 | `GET` | `/` | Service info + endpoint list |
 
-`POST /api/scrape-playlist` body: `{"playlistUrl": "https://open.spotify.com/..."}` (playlist, album, or track URL / `spotify:` URI).
+`POST /api/scrape-playlist` body: `{"playlistUrl": "https://open.spotify.com/..."}` (playlist, album, artist, or track URL / `spotify:` URI).
+
+For multiple sources, send `{"playlistUrls": ["spotify:artist:...", "spotify:album:..."]}`
+or a whitespace/comma-separated list in `playlistUrl`. The API validates the whole
+list first, ignores duplicate resources, and fetches each URL in order. Batch
+responses combine unique tracks and include `data.errors` with a `url` and safe
+error `message` for each failed source; successful sources are still returned.
+The response shape for a single unique URL is unchanged.
 
 ## Run locally
 
