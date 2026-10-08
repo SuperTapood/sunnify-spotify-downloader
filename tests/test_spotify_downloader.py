@@ -417,6 +417,182 @@ class TestDownloadTrackAudioOpts:
             None,
         ]
 
+    def test_youtube_reload_error_retries_same_video_without_cookies(self, tmp_path, monkeypatch):
+        import Spotify_Downloader as module
+
+        scraper = module.MusicScraper()
+        monkeypatch.setattr(module, "get_ffmpeg_path", lambda: str(tmp_path))
+        monkeypatch.setattr(
+            scraper,
+            "_select_youtube_match",
+            lambda *_args, **_kwargs: "https://www.youtube.com/watch?v=matched",
+        )
+        destination = tmp_path / "song.mp3"
+        seen = []
+
+        class FakeYDL:
+            cookiejar = object()
+
+            def __init__(self, opts):
+                self.opts = opts
+                seen.append(opts.get("cookiesfrombrowser"))
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def extract_info(self, _url, download=False):
+                assert download
+                if self.opts.get("cookiesfrombrowser"):
+                    self.opts["logger"].error("[youtube] matched: The page needs to be reloaded.")
+                    return None
+                destination.write_bytes(b"audio")
+                return None
+
+        monkeypatch.setattr(module, "YoutubeDL", FakeYDL)
+        assert scraper.download_track_audio("ytsearch1:Song", str(destination)) == str(destination)
+        assert seen == [("firefox",), None]
+        assert scraper._firefox_cookies_unavailable is True
+
+    def test_youtube_reload_during_search_retries_anonymously(self, monkeypatch):
+        import Spotify_Downloader as module
+
+        scraper = module.MusicScraper()
+        seen = []
+
+        class FakeYDL:
+            cookiejar = object()
+
+            def __init__(self, opts):
+                self.opts = opts
+                seen.append(opts.get("cookiesfrombrowser"))
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def extract_info(self, _url, download=False):
+                assert not download
+                if self.opts.get("cookiesfrombrowser"):
+                    self.opts["logger"].error("[youtube] matched: The page needs to be reloaded.")
+                    return None
+                return {"entries": [{"id": "matched", "title": "Song"}]}
+
+        monkeypatch.setattr(module, "YoutubeDL", FakeYDL)
+        assert scraper._select_youtube_match("ytsearch1:Song", None) == (
+            "https://www.youtube.com/watch?v=matched"
+        )
+        assert seen == [("firefox",), None]
+        assert scraper._firefox_cookies_unavailable is True
+
+    def test_second_credited_artist_search_finds_distinct_vocal_version(self):
+        from unittest.mock import MagicMock, patch
+
+        from Spotify_Downloader import MusicScraper
+
+        scraper = MusicScraper()
+        wrong_version = {
+            "id": "human",
+            "title": "エメラルド",
+            "channel": "Tatsuya Kitani",
+            "duration": 240,
+        }
+        vocal_version = {
+            "id": "vocaloid",
+            "title": "エメラルド / こんにちは谷田さん feat. 初音ミク",
+            "channel": "Tatsuya Kitani",
+            "duration": 240,
+        }
+        queries = []
+
+        def extract(query, download=False):
+            assert not download
+            queries.append(query)
+            if query == "https://www.youtube.com/watch?v=vocaloid":
+                return {**vocal_version, "channel_is_verified": True}
+            if query == 'ytsearch5:"エメラルド" "Hatsune Miku"':
+                return {"entries": [vocal_version]}
+            if query.startswith("ytsearch"):
+                return {"entries": [wrong_version]}
+            return wrong_version
+
+        with patch("Spotify_Downloader.YoutubeDL") as mock_ydl:
+            mock_ydl.return_value.__enter__ = MagicMock(return_value=mock_ydl)
+            mock_ydl.return_value.__exit__ = MagicMock(return_value=False)
+            mock_ydl.extract_info.side_effect = extract
+            result = scraper._select_youtube_match(
+                "ytsearch1:エメラルド こんにちは谷田さん Hatsune Miku audio",
+                240,
+                expected_title="エメラルド",
+                expected_artists="こんにちは谷田さん, Hatsune Miku",
+                expected_album="エメラルド",
+            )
+
+        assert result == "https://www.youtube.com/watch?v=vocaloid"
+        assert 'ytsearch5:"エメラルド" "Hatsune Miku"' in queries
+
+    def test_localized_self_titled_catalog_matches_credited_vocalist(self):
+        from unittest.mock import MagicMock, patch
+
+        from Spotify_Downloader import MusicScraper
+
+        scraper = MusicScraper()
+        flat = {
+            "id": "vocaloid",
+            "title": "Emerald / Hello Tanitasan feat. Hatsune Miku",
+            "channel": "Hello Tanitasan - Topic",
+            "uploader": "Hello Tanitasan - Topic",
+            "duration": 240,
+        }
+        hydrated = {
+            **flat,
+            "track": "Emerald",
+            "album": "Emerald",
+            "artist": "Hello Tanitasan, Hatsune Miku",
+            "artists": ["Hello Tanitasan", "Hatsune Miku"],
+            "description": "Provided to YouTube\nAuto-generated by YouTube.",
+        }
+        other_version = {
+            **flat,
+            "id": "human",
+            "title": "Emerald / Tatsuya Kitani",
+            "channel": "Tatsuya Kitani - Topic",
+            "uploader": "Tatsuya Kitani - Topic",
+        }
+
+        def extract(query, download=False):
+            assert not download
+            if query == "https://www.youtube.com/watch?v=vocaloid":
+                return hydrated
+            if query == "https://www.youtube.com/watch?v=human":
+                return {
+                    **other_version,
+                    "track": "Emerald",
+                    "album": "Emerald",
+                    "artist": "Tatsuya Kitani",
+                    "artists": ["Tatsuya Kitani"],
+                    "description": "Provided to YouTube\nAuto-generated by YouTube.",
+                }
+            return {"entries": [other_version, flat] if query.startswith("ytsearch") else []}
+
+        with patch("Spotify_Downloader.YoutubeDL") as mock_ydl:
+            mock_ydl.return_value.__enter__ = MagicMock(return_value=mock_ydl)
+            mock_ydl.return_value.__exit__ = MagicMock(return_value=False)
+            mock_ydl.extract_info.side_effect = extract
+            result = scraper._select_youtube_match(
+                "ytsearch5:エメラルド こんにちは谷田さん Hatsune Miku audio",
+                240,
+                expected_title="エメラルド",
+                expected_artists="こんにちは谷田さん, Hatsune Miku",
+                expected_album="エメラルド",
+            )
+
+        assert result == "https://www.youtube.com/watch?v=vocaloid"
+
     def test_ydl_opts_include_retries(self):
         """Verify yt-dlp retries option is set."""
         from Spotify_Downloader import MusicScraper
