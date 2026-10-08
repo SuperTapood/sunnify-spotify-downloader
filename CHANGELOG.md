@@ -13,6 +13,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **per-track album enrichment now reaches the YouTube matcher and final tags.** Compact Spotify playlist rows often omit their album even though the individual track endpoint supplies it; keeping that value makes album-bound catalog recovery reliable and prevents a licensed tribute or arranged release from impersonating the requested recording.
 - **real hyphenated titles and token boundaries are no longer mistaken for variants or substrings.** Only recognized release suffixes such as `Live`, `Video Edit`, and `Remastered 2011` are stripped, so `Emil - Despair` and `Dark Colossus - Kaiju` remain intact; `His Dream` can no longer match `This Dream`.
 
+## [2.4.3] - 2026-10-05
+
+### Fixed
+- **playlist downloads now get the album tag (closes #104).** Spotify's playlist feed returns no album for any track, while the single-track endpoint returns it, which is why the same song tagged correctly on its own and came down album-less inside a playlist. the per-track enrichment fetch that already existed for cover art now also carries album and release date, and runs whenever any of the three is missing rather than only when the cover is. no extra network cost in practice: the playlist and spclient feeds supply none of the three, so that fetch was already firing for every track.
+- **the Homebrew cask no longer warns on every install (closes #106).** `postflight` is deprecated and rejected in official taps, so `brew install`/`upgrade` printed a deprecation notice pointing at the tap. migrated to [`postflight_steps`](https://docs.brew.sh/Cask-Cookbook) with the quarantine strip expressed as a structured `run` step, keeping `must_succeed: false` so a failed `xattr` can never abort an install. the documented install is now the full cask name, `brew install --cask sunnypatell/sunnify/sunnify`: Homebrew 7 refuses a third-party cask by its short name until the tap is trusted, and naming it in full is what trusts it for later upgrades.
+
+### Notes
+- reported by [@datre9](https://github.com/datre9) (#104) and [@vv371](https://github.com/vv371) (#106).
+- verified before shipping: 309 tests green; the album gap reproduced against live Spotify (playlist feed returns `album=None`, single-track returns the real name) and the fix confirmed end to end with real downloads carrying album and year, then on the shipped binary against a 50-track playlist (50 of 50 with album and year). the cask was install-tested on isolated copies of Homebrew 7.0.8 and 6.0.16, the oldest release that supports the stanza: the legacy block prints the warning, the migrated one does not, and quarantine comes off every file in the app. the YouTube matcher is untouched. binaries built with yt-dlp 2026.8.19 on python 3.13.
+
+## [2.4.2] - 2026-09-08
+
+### Fixed
+- **a run that saved nothing no longer looks like a run that worked (#100).** the counter ticks once per finished track whether it passed or failed, so a fully failed playlist read `Songs downloaded 66 of 66`, the one-time star prompt fired off that count, and `ScraperThread` then overwrote the scraper's honest `Done! N track(s) failed` with a generic `Scraping completed.` on the same label. the counter now subtracts failures and names them, the star prompt only fires when something actually landed, and the terminal status is left alone.
+- **non-mp3 formats silently overwrote same-titled tracks (#100).** `_compose_filename` hardcoded `.mp3` while the file landed with its real extension, so the exists-check and the resume manifest's ownership map both looked for a path that never exists on flac, m4a, opus, or wav. that quietly disabled the same-title collision guard added in 2.3.0 for every format except mp3: two different songs called "Home" resolved to one file and the second overwrote the first. it also made crash recovery re-download a whole folder. verified across mp3/flac/m4a/opus, with real downloads and tag checks.
+- **FFmpeg is now checked before a run starts, not discovered through a failed download.** the GUI blocks with the install command for the platform it is actually running on, and detection additionally looks where the windows package managers put their shims, read from each tool's own env var so a relocated install still resolves. the shipped binaries bundle FFmpeg and never reach any of this; it is the run-from-source path that was failing confusingly.
+
+### Notes
+- found and diagnosed by [@urgorri](https://github.com/urgorri) in [#100](https://github.com/sunnypatell/sunnify-spotify-downloader/pull/100), whose commit is preserved in this release. the youtube matcher is deliberately untouched: it is byte-identical to 2.4.1 and its selector behaviour was diffed against the previous release before shipping.
+- verified before shipping: 308 tests green (20 new covering the data-loss case per format, crash recovery, counter accuracy including the reported `66 of 66`, star-prompt suppression, and the ffmpeg preflight); real single-track downloads in mp3, flac, and m4a landing tagged audio with correct extensions and working resume; the GUI exercised offscreen for every counter state; 10/10 upstream checks. binaries built with yt-dlp 2026.7.4 on python 3.13.
+
 ## [2.4.1] - 2026-08-31
 
 ### Fixed
@@ -393,7 +414,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Node 20+ for webclient
 - FFmpeg + yt-dlp for audio processing
 
-[Unreleased]: https://github.com/sunnypatell/sunnify-spotify-downloader/compare/v2.4.1...HEAD
+[Unreleased]: https://github.com/sunnypatell/sunnify-spotify-downloader/compare/v2.4.3...HEAD
+[2.4.3]: https://github.com/sunnypatell/sunnify-spotify-downloader/compare/v2.4.2...v2.4.3
+[2.4.2]: https://github.com/sunnypatell/sunnify-spotify-downloader/compare/v2.4.1...v2.4.2
 [2.4.1]: https://github.com/sunnypatell/sunnify-spotify-downloader/compare/v2.4.0...v2.4.1
 [2.4.0]: https://github.com/sunnypatell/sunnify-spotify-downloader/compare/v2.3.0...v2.4.0
 [2.3.0]: https://github.com/sunnypatell/sunnify-spotify-downloader/compare/v2.2.1...v2.3.0

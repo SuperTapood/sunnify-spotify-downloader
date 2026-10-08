@@ -1,20 +1,22 @@
 # Homebrew Cask for Sunnify
 # Install:
 #   brew tap sunnypatell/sunnify https://github.com/sunnypatell/sunnify-spotify-downloader
-#   brew install --cask sunnify
+#   brew install --cask sunnypatell/sunnify/sunnify
 
 cask "sunnify" do
-  arch arm: "", intel: "-Intel"
+  arch intel: "-Intel"
 
-  version "2.4.1"
+  version "2.4.3"
   # both shas are recomputed and rewritten by the release workflow
-  sha256 arm:   "a302c882816933a8d058eec2df84b4ab9e979fef5d1ce63add54ce94950665de",
-         intel: "23dd3092dca3d502613ba77686fdd8aff77ffc62ce703084f141ba4de5be9844"
+  sha256 arm:   "b17b56702af5ab554eed1f98ecaa2b63960f43cd67d2e5f379e8ed4574227346",
+         intel: "410fe154e92dce1b54c474b3f84907f8920e127ab175255aa3f65788436b47fe"
 
   url "https://github.com/sunnypatell/sunnify-spotify-downloader/releases/download/v#{version}/Sunnify-macOS#{arch}.zip"
   name "Sunnify"
   desc "Download Spotify playlists to local MP3s with artwork and tags"
   homepage "https://github.com/sunnypatell/sunnify-spotify-downloader"
+
+  depends_on :macos
 
   app "Sunnify.app"
   # headless CLI: the app binary dispatches on argv, so one symlink gives
@@ -23,18 +25,20 @@ cask "sunnify" do
 
   # App is ad-hoc signed (no paid Apple cert); brew already SHA256-verified
   # the archive, so strip quarantine to make first launch just work.
-  postflight do
-    system_command "/usr/bin/xattr",
-                   args: ["-r", "-d", "com.apple.quarantine", "#{appdir}/Sunnify.app"],
-                   must_succeed: false
+  # {{appdir}} is expanded by brew at install time (step args are literal
+  # otherwise), so this follows a custom --appdir instead of assuming /Applications.
+  postflight_steps do
+    run "/usr/bin/xattr",
+        args:         ["-r", "-d", "com.apple.quarantine", "{{appdir}}/Sunnify.app"],
+        must_succeed: false
   end
 
   uninstall quit: "com.sunnypatel.sunnify"
 
   zap trash: [
     "~/Library/Application Support/Sunnify",
-    "~/Library/Preferences/com.sunnypatel.sunnify.plist",
     "~/Library/Caches/com.sunnypatel.sunnify",
+    "~/Library/Preferences/com.sunnypatel.sunnify.plist",
   ]
 
   caveats <<~EOS

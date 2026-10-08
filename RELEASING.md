@@ -14,7 +14,7 @@ Don't trust a fixed file list - grep for the current version first, because a
 location has been missed before:
 
 ```bash
-grep -rnE "2\.4\.1|2, 4, 1" --include="*.py" --include="*.toml" \
+grep -rnE "2\.4\.3|2, 4, 3" --include="*.py" --include="*.toml" \
   --include="*.spec" --include="*.txt" --include="*.md" .
 ```
 
@@ -55,6 +55,15 @@ standing "verifying this release" + "install via homebrew (macos)" footers,
 `⭐ if sunnify saved you time, [star the repo](https://github.com/sunnypatell/sunnify-spotify-downloader) - stars are how people find it.`
 Write with `--notes-file`, never inline heredoc (shell-escaped backticks
 leak).
+
+The Homebrew footer is exactly this. The full cask name is required:
+Homebrew refuses a third-party cask installed by its short name until the
+tap has been trusted, and naming it in full is what trusts it.
+
+```bash
+brew tap sunnypatell/sunnify https://github.com/sunnypatell/sunnify-spotify-downloader
+brew install --cask sunnypatell/sunnify/sunnify
+```
 
 ## 4. Build + publish
 

@@ -17,7 +17,7 @@ For the program to work, the playlist URL pattern must follow the format of
 
 from __future__ import annotations
 
-__version__ = "2.4.1"
+__version__ = "2.4.3"
 
 import atexit
 import concurrent.futures
@@ -206,6 +206,18 @@ def get_ffmpeg_path():
         "/usr/local/bin",  # macOS Intel homebrew / Linux
         "/usr/bin",  # Linux system
     ]
+    if sys.platform == "win32":
+        # package managers put these on PATH, so shutil.which below usually
+        # wins first; these cover the install-then-same-shell case, and are
+        # read from each tool's own env var so a relocated install still hits
+        choco = os.environ.get("CHOCOLATEYINSTALL") or r"C:\ProgramData\chocolatey"
+        scoop = os.environ.get("SCOOP") or os.path.join(os.path.expanduser("~"), "scoop")
+        common_paths += [
+            os.path.join(choco, "bin"),
+            os.path.expandvars(r"%LOCALAPPDATA%\Microsoft\WinGet\Links"),
+            os.path.join(scoop, "shims"),
+            r"C:\ffmpeg\bin",  # the unzip convention, the one that never lands on PATH
+        ]
 
     for path in common_paths:
         ffmpeg = os.path.join(path, ffmpeg_name)
@@ -218,6 +230,29 @@ def get_ffmpeg_path():
     ffmpeg_in_path = shutil.which("ffmpeg")
     if ffmpeg_in_path:
         return os.path.dirname(ffmpeg_in_path)
+
+    # On Windows, check user/machine environment in case PATH was modified recently
+    if sys.platform == "win32":
+        try:
+            import winreg
+
+            for hkey in (winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE):
+                sub = (
+                    r"Environment"
+                    if hkey == winreg.HKEY_CURRENT_USER
+                    else r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment"
+                )
+                try:
+                    with winreg.OpenKey(hkey, sub) as key:
+                        val, _ = winreg.QueryValueEx(key, "PATH")
+                        for p in val.split(os.pathsep):
+                            expanded = os.path.expandvars(p.strip())
+                            if expanded and os.path.exists(os.path.join(expanded, "ffmpeg.exe")):
+                                return expanded
+                except OSError:
+                    pass
+        except Exception:
+            pass
 
     return None
 
@@ -2146,10 +2181,13 @@ class MusicScraper(QThread):
         # Check for FFmpeg first
         ffmpeg_path = get_ffmpeg_path()
         if not ffmpeg_path:
-            raise RuntimeError(
-                "FFmpeg not found! Install via: brew install ffmpeg (macOS) "
-                "or apt install ffmpeg (Linux)"
-            )
+            if sys.platform == "win32":
+                instructions = "Install via: winget install Gyan.FFmpeg or choco install ffmpeg"
+            elif sys.platform == "darwin":
+                instructions = "Install via: brew install ffmpeg (macOS)"
+            else:
+                instructions = "Install via: apt install ffmpeg (Linux)"
+            raise RuntimeError(f"FFmpeg not found! {instructions}")
 
         fmt = self.audio_format if self.audio_format in SUPPORTED_FORMATS else "mp3"
         ext = SUPPORTED_FORMATS[fmt]["ext"]
@@ -2313,15 +2351,16 @@ class MusicScraper(QThread):
         sanitized_title = self.sanitize_text(track_title)
         sanitized_artists = self.sanitize_text(artists)
 
-        # Per-track cover enrichment: the playlist embed has no per-track
-        # cover urls (the "all 300 songs have the same cover" report), so
-        # fetch /embed/track/{id} when missing. ~100-300ms per track,
-        # overlapped by other workers in parallel mode.
+        # Per-track enrichment: the playlist embed carries no per-track cover
+        # url (the "all 300 songs have the same cover" report) and no album
+        # at all (#104), so fetch /embed/track/{id} when any of them is
+        # missing. ~100-300ms per track, overlapped by other workers in
+        # parallel mode.
         cover_url = track.cover_url
-        release_date = track.release_date or ""
         album_name = track.album or ""
+        release_date = track.release_date or ""
         if (
-            not cover_url
+            (not cover_url or not album_name or not release_date)
             and track.id
             and self.spotifydown_api is not None
             and not self.is_cancelled()
@@ -2331,16 +2370,16 @@ class MusicScraper(QThread):
                 if enriched:
                     if enriched.cover_url:
                         cover_url = enriched.cover_url
-                    if not release_date and enriched.release_date:
-                        release_date = enriched.release_date
                     if not album_name and enriched.album:
                         album_name = enriched.album
+                    if not release_date and enriched.release_date:
+                        release_date = enriched.release_date
             except InterruptedError:
                 if self.is_cancelled():
                     return None
                 raise
             except SpotifyDownAPIError as exc:
-                log.debug("cover enrichment failed for '%s': %s", track_title, exc)
+                log.debug("track enrichment failed for '%s': %s", track_title, exc)
 
         cover_url = cover_url or default_cover_url
 
@@ -3831,7 +3870,15 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         nagging). Deferred cases (update toast on screen) retry naturally
         when the next song lands - the flag only persists once the dialog
         actually shows, so the one shot is never burned silently."""
-        if count < 1 or self._config.get("star_prompt_shown"):
+        if self._config.get("star_prompt_shown"):
+            return
+        # Queue snapshots already count saved files across all URLs. The
+        # legacy counter counts finished tracks, including failures.
+        snapshot = self._last_progress_snapshot
+        saved = (
+            snapshot["downloaded"] if snapshot is not None else count - self._failed_track_count()
+        )
+        if saved < 1:
             return
         if self._cancel_event.is_set():
             return
@@ -3964,6 +4011,27 @@ class MainWindow(QMainWindow, Ui_MainWindow):
             spotify_urls = parse_spotify_urls(self.PlaylistLink.text())
         except ValueError as exc:
             self.statusMsg.setText(str(exc))
+            return
+
+        if not get_ffmpeg_path():
+            if sys.platform == "win32":
+                instructions = (
+                    "Install FFmpeg on Windows using:\n"
+                    "  winget install Gyan.FFmpeg\n"
+                    "or\n"
+                    "  choco install ffmpeg\n\n"
+                    "Then restart Sunnify."
+                )
+            elif sys.platform == "darwin":
+                instructions = "Install FFmpeg on macOS using:\n  brew install ffmpeg"
+            else:
+                instructions = "Install FFmpeg on Linux using:\n  sudo apt install ffmpeg"
+            self.statusMsg.setText("FFmpeg not found")
+            QMessageBox.critical(
+                self,
+                "FFmpeg Required",
+                f"FFmpeg is required for audio downloads and conversion but was not found on your system.\n\n{instructions}",
+            )
             return
 
         # ALWAYS prompt for download location on first download
@@ -4165,18 +4233,29 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         self.AlbumName.setText(AlbumName)
         self.AlbumName.setToolTip(AlbumName)
 
+    def _live_scraper(self):
+        """The running scraper, or None once the thread is gone (qt raises
+        RuntimeError on a deleted object, which outlives the python ref)."""
+        try:
+            return getattr(getattr(self, "scraper_thread", None), "scraper", None)
+        except RuntimeError:
+            return None
+
+    def _failed_track_count(self) -> int:
+        return len(getattr(self._live_scraper(), "_failed_tracks", []) or [])
+
     @pyqtSlot(int)
     def update_counter(self, count):
-        total = 0
-        if hasattr(self, "scraper_thread") and self.scraper_thread is not None:
-            try:
-                total = self.scraper_thread.scraper._total_tracks or 0
-            except AttributeError:
-                total = 0
-        if total > 0:
-            self.CounterLabel.setText(f"Songs downloaded {count} of {total}")
-        else:
-            self.CounterLabel.setText("Songs downloaded " + str(count))
+        scraper = self._live_scraper()
+        total = getattr(scraper, "_total_tracks", 0) or 0
+        failed = self._failed_track_count()
+        # count is "tracks finished", not "tracks saved": a failure ticks it too
+        text = f"Songs downloaded {max(0, count - failed)}"
+        if total:
+            text += f" of {total}"
+        if failed:
+            text += f" ({failed} failed)"
+        self.CounterLabel.setText(text)
 
     @pyqtSlot(int)
     def update_song_progress(self, progress):

@@ -123,6 +123,29 @@ class TestScrapePlaylistEndpoint:
         data = response.get_json()
         assert data["event"] == "error"
 
+    def test_malformed_json_returns_400(self, client):
+        response = client.post(
+            "/api/scrape-playlist",
+            data="{not-json",
+            content_type="application/json",
+        )
+        assert response.status_code == 400
+        assert response.get_json()["event"] == "error"
+
+    def test_non_object_json_returns_400(self, client):
+        response = client.post(
+            "/api/scrape-playlist",
+            json=["https://open.spotify.com/playlist/abc123"],
+        )
+        assert response.status_code == 400
+        assert response.get_json()["data"]["message"] == "Invalid request body"
+
+    @pytest.mark.parametrize("value", [123, None, ["https://open.spotify.com/playlist/abc123"]])
+    def test_non_string_url_returns_400(self, client, value):
+        response = client.post("/api/scrape-playlist", json={"playlistUrl": value})
+        assert response.status_code == 400
+        assert "No URL" in response.get_json()["data"]["message"]
+
     @patch("app.get_playlist_client")
     def test_valid_playlist_url(self, mock_get_client, client):
         """Valid playlist URL should return track data."""

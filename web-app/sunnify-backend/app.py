@@ -115,8 +115,14 @@ def scrape_playlist():
     try:
         data = request.get_json(silent=True)
         if not isinstance(data, dict):
-            return jsonify({"event": "error", "data": {"message": "Invalid JSON body"}}), 400
-        raw_urls = data.get("playlistUrls", data.get("playlistUrl", ""))
+            return jsonify({"event": "error", "data": {"message": "Invalid request body"}}), 400
+        if "playlistUrls" in data:
+            raw_urls = data["playlistUrls"]
+        else:
+            raw_urls = data.get("playlistUrl")
+            if not isinstance(raw_urls, str) or not raw_urls.strip():
+                return jsonify({"event": "error", "data": {"message": "No URL provided"}}), 400
+            raw_urls = raw_urls.strip()
         if not raw_urls:
             return jsonify({"event": "error", "data": {"message": "No URL provided"}}), 400
         # Validate the entire queue before making any upstream requests.
@@ -185,7 +191,7 @@ def index():
     return jsonify(
         {
             "name": "Sunnify API",
-            "version": "2.4.1",
+            "version": "2.4.3",
             "mode": "metadata-only",
             "description": "Fetches Spotify metadata. For MP3 downloads, use the desktop app.",
             "endpoints": {

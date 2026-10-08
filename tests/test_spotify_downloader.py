@@ -368,13 +368,25 @@ class TestDownloadTrackAudioOpts:
 
             def extract_info(self, url, download=False):
                 if not download:
-                    return {"entries": [{"id": "song", "title": "Artist - Song", "channel": "Artist", "duration": 180}]}
+                    return {
+                        "entries": [
+                            {
+                                "id": "song",
+                                "title": "Artist - Song",
+                                "channel": "Artist",
+                                "duration": 180,
+                            }
+                        ]
+                    }
                 (tmp_path / "song.mp3").write_bytes(b"audio")
 
         monkeypatch.setattr(module, "YoutubeDL", FakeYDL)
         scraper.download_track_audio(
-            "ytsearch1:Song Artist audio", str(tmp_path / "song.mp3"),
-            expected_duration_s=180, expected_title="Song", expected_artists="Artist",
+            "ytsearch1:Song Artist audio",
+            str(tmp_path / "song.mp3"),
+            expected_duration_s=180,
+            expected_title="Song",
+            expected_artists="Artist",
         )
         assert len(options_seen) == 2
         assert all(opts["cookiesfrombrowser"] == ("firefox",) for opts in options_seen)
@@ -400,7 +412,9 @@ class TestDownloadTrackAudioOpts:
         scraper._youtube_dl({"quiet": True})
         scraper._youtube_dl({"quiet": True})
         assert [opts.get("cookiesfrombrowser") for opts in options_seen] == [
-            ("firefox",), None, None,
+            ("firefox",),
+            None,
+            None,
         ]
 
     def test_ydl_opts_include_retries(self):
@@ -517,11 +531,28 @@ class TestDownloadTrackAudioOpts:
             def extract_info(self, url, download=False):
                 if not download:
                     searched.append(url)
-                    return {"entries": [
-                        {"id": "unavailable", "title": "Artist - Song", "channel": "Artist", "duration": 180},
-                        {"id": "wrong", "title": "Artist - Other Tune", "channel": "Artist", "duration": 180},
-                        {"id": "playable", "title": "Artist - Song", "channel": "Artist", "duration": 181},
-                    ]}
+                    return {
+                        "entries": [
+                            {
+                                "id": "unavailable",
+                                "title": "Artist - Song",
+                                "channel": "Artist",
+                                "duration": 180,
+                            },
+                            {
+                                "id": "wrong",
+                                "title": "Artist - Other Tune",
+                                "channel": "Artist",
+                                "duration": 180,
+                            },
+                            {
+                                "id": "playable",
+                                "title": "Artist - Song",
+                                "channel": "Artist",
+                                "duration": 181,
+                            },
+                        ]
+                    }
                 downloaded.append(url)
                 if url.endswith("playable"):
                     destination.write_bytes(b"audio")
@@ -3124,10 +3155,12 @@ class TestCoverEnrichment:
         assert download_kwargs["expected_album"] == "Exact Album"
         assert tagged[0]["album"] == "Exact Album"
 
-    def test_existing_cover_skips_enrichment(self, tmp_path):
-        """Track that already has cover_url (e.g. spclient fallback path) does
-        not trigger a second network call."""
+    def test_complete_track_skips_enrichment(self, tmp_path):
+        """A track that already carries everything the tags need does not
+        trigger a second network call. Cover alone is no longer enough: the
+        playlist feeds also omit album, which is what #104 was."""
         from Spotify_Downloader import MusicScraper
+        from spotifydown_api import TrackInfo
 
         scraper = MusicScraper()
         self._stub_scraper_signals(scraper)
@@ -3136,12 +3169,43 @@ class TestCoverEnrichment:
         mock_api = MagicMock()
         scraper.spotifydown_api = mock_api
 
-        scraper._download_one_track(
-            self._track(cover="https://already/present.jpg"),
-            str(tmp_path),
-            "fallback",
+        complete = TrackInfo(
+            id="id1",
+            title="Song",
+            artists="Artist",
+            album="Album",
+            release_date="2024-06-01",
+            cover_url="https://already/present.jpg",
+            duration_ms=None,
+            preview_url=None,
+            raw={},
         )
+        scraper._download_one_track(complete, str(tmp_path), "fallback")
         mock_api.get_track.assert_not_called()
+
+    def test_missing_album_triggers_enrichment(self, tmp_path):
+        """#104: playlist feeds return album=None for every track, so a cover
+        on its own must not short-circuit the fetch that carries the album."""
+        from Spotify_Downloader import MusicScraper
+
+        scraper = MusicScraper()
+        self._stub_scraper_signals(scraper)
+        scraper.download_track_audio = lambda _q, d, **_kw: open(d, "wb").close() or d
+
+        mock_api = MagicMock()
+        enriched = self._track(cover="https://real/cover.jpg", release_date="2024-06-01")
+        enriched.album = "Real Album"
+        mock_api.get_track.return_value = enriched
+        scraper.spotifydown_api = mock_api
+
+        captured = []
+        scraper.add_song_meta.emit.side_effect = lambda meta: captured.append(meta)
+
+        scraper._download_one_track(
+            self._track(cover="https://already/present.jpg"), str(tmp_path), "fallback"
+        )
+        mock_api.get_track.assert_called_once_with("id1")
+        assert captured[0]["album"] == "Real Album"
 
     def test_enrichment_failure_falls_back_to_playlist_cover(self, tmp_path):
         """If get_track raises, the worker silently falls back to default_cover_url."""
@@ -4734,6 +4798,7 @@ class TestStarPrompt:
         win = MainWindow.__new__(MainWindow)
         win._config = {"star_prompt_shown": shown}
         win._cancel_event = threading.Event()
+        win._last_progress_snapshot = None
         if cancelled:
             win._cancel_event.set()
         return win
@@ -4938,3 +5003,235 @@ class TestAtomicConfigPersistence:
         data = json.loads(config_path.read_text(encoding="utf-8"))
         assert data["writer"] in range(40)
         assert list(tmp_path.glob(".config-*.tmp")) == []
+
+
+class TestDownloadReportingAccuracy:
+    """A run that saved nothing must not look like a run that worked (#100).
+
+    The counter ticks once per finished track whether it passed or failed,
+    so a fully failed playlist read "Songs downloaded 66 of 66", the star
+    prompt fired off it, and ScraperThread then overwrote the honest
+    "Done! N failed" status with a generic "Scraping completed.".
+    Reported by @urgorri.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _no_external_io(self, monkeypatch):
+        import Spotify_Downloader as sd
+
+        monkeypatch.setattr(sd.UpdateCheckThread, "start", lambda _self: None)
+        monkeypatch.setattr(sd, "save_config", lambda _cfg: None)
+
+    def _window_with(self, total, failed):
+        from Spotify_Downloader import MainWindow
+
+        win = MainWindow()
+        thread = MagicMock()
+        thread.scraper._total_tracks = total
+        thread.scraper._failed_tracks = list(failed)
+        win.scraper_thread = thread
+        return win
+
+    def test_counter_subtracts_failures(self, qapp):
+        win = self._window_with(10, ["a", "b"])
+        win.update_counter(5)
+        assert win.CounterLabel.text() == "Songs downloaded 3 of 10 (2 failed)"
+
+    def test_counter_omits_failure_clause_when_clean(self, qapp):
+        win = self._window_with(10, [])
+        win.update_counter(5)
+        assert win.CounterLabel.text() == "Songs downloaded 5 of 10"
+
+    def test_counter_all_failed_reads_zero(self, qapp):
+        """The reported symptom: 66 of 66 while nothing landed."""
+        win = self._window_with(66, [f"t{i}" for i in range(66)])
+        win.update_counter(66)
+        assert win.CounterLabel.text() == "Songs downloaded 0 of 66 (66 failed)"
+
+    def test_counter_survives_a_dead_scraper_thread(self, qapp):
+        """Qt raises RuntimeError on a deleted object; the slot still fires."""
+        from Spotify_Downloader import MainWindow
+
+        win = MainWindow()
+        thread = MagicMock()
+        type(thread).scraper = property(lambda _self: (_ for _ in ()).throw(RuntimeError()))
+        win.scraper_thread = thread
+        win.update_counter(3)
+        assert win.CounterLabel.text() == "Songs downloaded 3"
+
+    def test_star_prompt_skipped_when_nothing_landed(self, qapp, monkeypatch):
+        win = self._window_with(5, ["only-track"])
+        win._config = {"star_prompt_shown": False}
+        shown = []
+        monkeypatch.setattr(
+            "Spotify_Downloader.StarPromptNotifier",
+            lambda *a, **_k: shown.append(a) or MagicMock(),
+        )
+        win._maybe_show_star_prompt(1)  # 1 finished, 1 failed -> 0 landed
+        assert shown == []
+
+    def test_star_prompt_still_fires_when_a_track_landed(self, qapp, monkeypatch):
+        win = self._window_with(5, ["one-failure"])
+        win._config = {"star_prompt_shown": False}
+        win._cancel_event = threading.Event()
+        shown = []
+
+        class _Notifier:
+            def __init__(self, *a, **k):
+                shown.append(a)
+
+            def exec(self):
+                return None
+
+        monkeypatch.setattr("Spotify_Downloader.StarPromptNotifier", _Notifier)
+        monkeypatch.setattr("Spotify_Downloader.QApplication.activeModalWidget", lambda: None)
+        win._maybe_show_star_prompt(3)  # 3 finished, 1 failed -> 2 landed
+        assert shown, "a run that saved tracks should still get the one-time ask"
+
+    @pytest.mark.parametrize("saved", [0, 1])
+    def test_queue_saved_count_is_not_reduced_by_failures(self, qapp, monkeypatch, saved):
+        win = self._window_with(6, ["failed"] * 5)
+        win._config = {"star_prompt_shown": False}
+        win._last_progress_snapshot = {"downloaded": saved}
+        shown = []
+        monkeypatch.setattr(
+            "Spotify_Downloader.StarPromptNotifier",
+            lambda *a, **_k: shown.append(a) or MagicMock(),
+        )
+        monkeypatch.setattr("Spotify_Downloader.save_config", lambda _cfg: None)
+        monkeypatch.setattr("Spotify_Downloader.QApplication.activeModalWidget", lambda: None)
+
+        win._maybe_show_star_prompt(saved)
+
+        assert bool(shown) == bool(saved)
+
+    def test_scraper_thread_does_not_overwrite_the_final_status(self):
+        """ScraperThread used to emit a generic completion after the scraper
+        had already reported the real outcome, onto the same label."""
+        import inspect
+
+        from Spotify_Downloader import ScraperThread
+
+        assert "Scraping completed." not in inspect.getsource(ScraperThread.run)
+
+
+class TestAudioFormatExtension:
+    """_compose_filename hardcoded .mp3 while the file landed with its real
+    extension, so the exists-check and the manifest ownership map both looked
+    for a path that never existed on flac/m4a/opus/wav (#100).
+
+    That silently disabled the same-title collision guard for those formats:
+    two different songs called "Home" overwrote each other. Reported by
+    @urgorri; the collision guard it broke was added in 2.3.0.
+    """
+
+    def _scraper(self, fmt, **kw):
+        from Spotify_Downloader import MusicScraper
+
+        s = MusicScraper(audio_format=fmt, **kw)
+        for sig in (
+            "song_meta",
+            "add_song_meta",
+            "dlprogress_signal",
+            "Resetprogress_signal",
+            "PlaylistID",
+            "song_Album",
+            "PlaylistCompleted",
+            "error_signal",
+            "count_updated",
+        ):
+            setattr(s, sig, MagicMock())
+
+        def fake_download(_query, destination, **_kw):
+            landed = os.path.splitext(destination)[0] + "." + fmt
+            with open(landed, "wb") as fh:
+                fh.write(b"audio")
+            return landed
+
+        s.download_track_audio = fake_download
+        return s
+
+    def _track(self, tid, title, artists):
+        from spotifydown_api import TrackInfo
+
+        return TrackInfo(
+            id=tid,
+            title=title,
+            artists=artists,
+            album="Album",
+            release_date="2024-01-01",
+            cover_url=None,
+            duration_ms=1000,
+            preview_url=None,
+            raw={},
+        )
+
+    @pytest.mark.parametrize("fmt", ["mp3", "m4a", "opus", "flac", "wav"])
+    def test_filename_uses_the_configured_extension(self, fmt):
+        from Spotify_Downloader import SUPPORTED_FORMATS
+
+        name = self._scraper(fmt)._compose_filename("Song", "Artist")
+        assert name.endswith("." + SUPPORTED_FORMATS[fmt]["ext"])
+
+    @pytest.mark.parametrize("fmt", ["mp3", "flac", "m4a", "opus"])
+    def test_same_title_tracks_do_not_overwrite_each_other(self, fmt, tmp_path):
+        """The data-loss case: title_only naming, two distinct songs, one title."""
+        scraper = self._scraper(fmt, title_only=True)
+        scraper._load_manifest(str(tmp_path))
+        scraper._download_one_track(self._track("tA", "Home", "ArtistA"), str(tmp_path), "", 1)
+        scraper._download_one_track(self._track("tB", "Home", "ArtistB"), str(tmp_path), "", 2)
+        audio = [f for f in os.listdir(tmp_path) if not f.startswith(".")]
+        assert len(audio) == 2, f"{fmt}: second track overwrote the first ({audio})"
+
+    @pytest.mark.parametrize("fmt", ["mp3", "flac"])
+    def test_crash_recovery_does_not_redownload(self, fmt, tmp_path):
+        """Audio present, manifest lost: the exists-check has to see the file."""
+        first = self._scraper(fmt)
+        first._load_manifest(str(tmp_path))
+        first._download_one_track(self._track("tA", "Song", "Artist"), str(tmp_path), "", 1)
+        os.remove(tmp_path / ".sunnify-manifest.jsonl")
+
+        second = self._scraper(fmt)
+        second._load_manifest(str(tmp_path))
+        attempted = []
+        real = second.download_track_audio
+        second.download_track_audio = lambda q, d, **k: (attempted.append(d), real(q, d, **k))[1]
+        second._download_one_track(self._track("tA", "Song", "Artist"), str(tmp_path), "", 1)
+        assert attempted == [], f"{fmt}: re-downloaded a track already on disk"
+
+
+class TestFfmpegPreflight:
+    """Missing FFmpeg used to surface only as a failed download; it is now
+    caught before the run with per-OS install guidance (#100)."""
+
+    @pytest.fixture(autouse=True)
+    def _no_update_thread(self, monkeypatch):
+        import Spotify_Downloader as sd
+
+        monkeypatch.setattr(sd.UpdateCheckThread, "start", lambda _self: None)
+
+    def test_download_blocked_and_explained_without_ffmpeg(self, qapp, monkeypatch):
+        from Spotify_Downloader import MainWindow
+
+        win = MainWindow()
+        win.PlaylistLink.setText("https://open.spotify.com/track/4uLU6hMCjMI75M1A2tKUQC")
+        win._download_path_set = True
+        monkeypatch.setattr("Spotify_Downloader.get_ffmpeg_path", lambda: None)
+        shown = []
+        monkeypatch.setattr(
+            "Spotify_Downloader.QMessageBox.critical", lambda *a, **_k: shown.append(a)
+        )
+        win.on_returnButton()
+        assert win.statusMsg.text() == "FFmpeg not found"
+        assert len(shown) == 1
+        assert not win._is_downloading
+
+    def test_engine_error_names_the_platform_installer(self, monkeypatch):
+        from Spotify_Downloader import MusicScraper
+
+        monkeypatch.setattr("Spotify_Downloader.get_ffmpeg_path", lambda: None)
+        expected = {"win32": "winget", "darwin": "brew", "linux": "apt"}
+        for platform, needle in expected.items():
+            monkeypatch.setattr(sys, "platform", platform)
+            with pytest.raises(RuntimeError, match=needle):
+                MusicScraper().download_track_audio("ytsearch1:x", "/tmp/none.mp3")
