@@ -184,7 +184,6 @@ class TestDownloadGuards:
         cfg["cookies_file"] = "/saved/cookies.txt"
         assert not cli._resolve_settings(_args(cookies=""), cfg)["cookies_file"]
 
-
     def test_setup_failure_releases_folder_lock(self, tmp_path, capsys):
         with (
             patch.object(sd, "get_ffmpeg_path", return_value="/usr/bin/true"),
@@ -203,6 +202,7 @@ class TestDownloadGuards:
         replacement = cli._FolderLock(str(tmp_path))
         assert replacement.acquire() is None
         replacement.release()
+
 
 class TestFolderLock:
     def test_stale_lock_is_claimed(self, tmp_path):

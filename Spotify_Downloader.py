@@ -773,7 +773,9 @@ class MusicScraper(QThread):
     MAX_WORKERS = 4
 
     def _youtube_dl(self, options):
-        """Use Firefox cookies by default; continue anonymously if unavailable."""
+        """Use an explicit cookie file, otherwise try Firefox with anonymous fallback."""
+        if self.cookies_file:
+            return self._youtube(options)
         opts = dict(options)
         if not getattr(self, "_firefox_cookies_unavailable", False):
             opts["cookiesfrombrowser"] = ("firefox",)
@@ -810,6 +812,7 @@ class MusicScraper(QThread):
     def _retry_youtube_without_cookies(self, reason, attempt):
         if (
             attempt == 0
+            and not self.cookies_file
             and not getattr(self, "_firefox_cookies_unavailable", False)
             and "the page needs to be reloaded" in reason.lower()
         ):
@@ -2065,8 +2068,10 @@ class MusicScraper(QThread):
                             for artist, matched in zip(artist_tokens, matches, strict=True)
                             if not matched
                         ]
-                        artist_ok = bool(any(matches)) and len(unmatched) == 1 and (
-                            self._has_non_latin_letters(unmatched[0])
+                        artist_ok = (
+                            bool(any(matches))
+                            and len(unmatched) == 1
+                            and (self._has_non_latin_letters(unmatched[0]))
                         )
                     else:
                         artist_ok = (
@@ -2474,7 +2479,9 @@ class MusicScraper(QThread):
                             raise InterruptedError("download cancelled") from exc
                     else:
                         if not os.path.exists(expected_path):
-                            failure_reason = (ytlog.last_error or "no error reported by yt-dlp").strip()
+                            failure_reason = (
+                                ytlog.last_error or "no error reported by yt-dlp"
+                            ).strip()
                             log.warning(
                                 "download attempt (%s) produced no file for %s: %s",
                                 label,

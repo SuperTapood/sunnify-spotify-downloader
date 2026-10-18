@@ -368,13 +368,25 @@ class TestDownloadTrackAudioOpts:
 
             def extract_info(self, url, download=False):
                 if not download:
-                    return {"entries": [{"id": "song", "title": "Artist - Song", "channel": "Artist", "duration": 180}]}
+                    return {
+                        "entries": [
+                            {
+                                "id": "song",
+                                "title": "Artist - Song",
+                                "channel": "Artist",
+                                "duration": 180,
+                            }
+                        ]
+                    }
                 (tmp_path / "song.mp3").write_bytes(b"audio")
 
         monkeypatch.setattr(module, "YoutubeDL", FakeYDL)
         scraper.download_track_audio(
-            "ytsearch1:Song Artist audio", str(tmp_path / "song.mp3"),
-            expected_duration_s=180, expected_title="Song", expected_artists="Artist",
+            "ytsearch1:Song Artist audio",
+            str(tmp_path / "song.mp3"),
+            expected_duration_s=180,
+            expected_title="Song",
+            expected_artists="Artist",
         )
         assert len(options_seen) == 2
         assert all(opts["cookiesfrombrowser"] == ("firefox",) for opts in options_seen)
@@ -400,7 +412,9 @@ class TestDownloadTrackAudioOpts:
         scraper._youtube_dl({"quiet": True})
         scraper._youtube_dl({"quiet": True})
         assert [opts.get("cookiesfrombrowser") for opts in options_seen] == [
-            ("firefox",), None, None,
+            ("firefox",),
+            None,
+            None,
         ]
 
     def test_youtube_reload_error_retries_same_video_without_cookies(self, tmp_path, monkeypatch):
@@ -693,11 +707,28 @@ class TestDownloadTrackAudioOpts:
             def extract_info(self, url, download=False):
                 if not download:
                     searched.append(url)
-                    return {"entries": [
-                        {"id": "unavailable", "title": "Artist - Song", "channel": "Artist", "duration": 180},
-                        {"id": "wrong", "title": "Artist - Other Tune", "channel": "Artist", "duration": 180},
-                        {"id": "playable", "title": "Artist - Song", "channel": "Artist", "duration": 181},
-                    ]}
+                    return {
+                        "entries": [
+                            {
+                                "id": "unavailable",
+                                "title": "Artist - Song",
+                                "channel": "Artist",
+                                "duration": 180,
+                            },
+                            {
+                                "id": "wrong",
+                                "title": "Artist - Other Tune",
+                                "channel": "Artist",
+                                "duration": 180,
+                            },
+                            {
+                                "id": "playable",
+                                "title": "Artist - Song",
+                                "channel": "Artist",
+                                "duration": 181,
+                            },
+                        ]
+                    }
                 downloaded.append(url)
                 if url.endswith("playable"):
                     destination.write_bytes(b"audio")
@@ -4479,6 +4510,94 @@ class TestYoutubeCookies:
     """Opt-in youtube cookies (#112): the user's file is only ever read, and
     the anonymous path stays exactly as it was."""
 
+    def test_explicit_cookies_used_for_search_and_download(self, tmp_path, monkeypatch):
+        import Spotify_Downloader as module
+
+        user_file = tmp_path / "cookies.txt"
+        user_file.write_text(GOOD_COOKIES, encoding="utf-8")
+        before = user_file.read_bytes()
+        scraper = module.MusicScraper(cookies_file=str(user_file))
+        destination = tmp_path / "song.mp3"
+        options_seen = []
+        monkeypatch.setattr(module, "get_ffmpeg_path", lambda: str(tmp_path))
+        monkeypatch.setattr(module, "find_deno", lambda: "deno")
+
+        class FakeYDL:
+            def __init__(self, opts):
+                options_seen.append(opts)
+                self.cookie_file = Path(opts["cookiefile"])
+                assert "PREF" in self.cookie_file.read_text(encoding="utf-8")
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                self.cookie_file.write_text("rewritten by yt-dlp", encoding="utf-8")
+                return False
+
+            def extract_info(self, url, download=False):
+                if not download:
+                    return {
+                        "entries": [
+                            {
+                                "id": "song",
+                                "title": "Artist - Song",
+                                "channel": "Artist",
+                                "duration": 180,
+                            }
+                        ]
+                    }
+                destination.write_bytes(b"audio")
+
+        monkeypatch.setattr(module, "YoutubeDL", FakeYDL)
+        result = scraper.download_track_audio(
+            "ytsearch1:Song Artist audio",
+            str(destination),
+            expected_duration_s=180,
+            expected_title="Song",
+            expected_artists="Artist",
+        )
+
+        assert result == str(destination)
+        assert len(options_seen) == 2
+        copies = [opts["cookiefile"] for opts in options_seen]
+        assert len(set(copies)) == 2
+        assert all("cookiesfrombrowser" not in opts for opts in options_seen)
+        assert all(opts["js_runtimes"] == {"deno": {"path": "deno"}} for opts in options_seen)
+        assert all(not os.path.exists(copy) for copy in copies)
+        assert user_file.read_bytes() == before
+
+    def test_rejected_explicit_cookies_do_not_trigger_firefox_fallback(self, tmp_path, monkeypatch):
+        import Spotify_Downloader as module
+
+        user_file = tmp_path / "cookies.txt"
+        user_file.write_text(GOOD_COOKIES, encoding="utf-8")
+        scraper = module.MusicScraper(cookies_file=str(user_file))
+        options_seen = []
+        monkeypatch.setattr(module, "find_deno", lambda: "deno")
+
+        class FakeYDL:
+            def __init__(self, opts):
+                options_seen.append(opts)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def extract_info(self, url, download=False):
+                raise RuntimeError("The page needs to be reloaded")
+
+        monkeypatch.setattr(module, "YoutubeDL", FakeYDL)
+        with pytest.raises(RuntimeError, match="The page needs to be reloaded"):
+            scraper._extract_youtube_info({"quiet": True}, "ytsearch1:Song Artist audio")
+
+        assert len(options_seen) == 1
+        assert "cookiesfrombrowser" not in options_seen[0]
+        assert not os.path.exists(options_seen[0]["cookiefile"])
+        assert user_file.read_text(encoding="utf-8") == GOOD_COOKIES
+
     def _capture_ydl(self, scraper, opts=None):
         seen = {}
 
@@ -5258,6 +5377,42 @@ class TestStarPrompt:
         assert not dlg.isVisible()
 
 
+class TestAtomicConfigPersistence:
+    def test_failed_replace_preserves_previous_config_and_cleans_temp(self, tmp_path):
+        import Spotify_Downloader as module
+
+        config_path = tmp_path / "config.json"
+        with patch.object(module, "_config_path", return_value=str(config_path)):
+            module.save_config({"format": "mp3"})
+            before = config_path.read_bytes()
+            with patch.object(module.os, "replace", side_effect=OSError("disk full")):
+                module.save_config({"format": "flac"})
+
+        assert config_path.read_bytes() == before
+        assert list(tmp_path.glob(".config-*.tmp")) == []
+
+    def test_parallel_saves_always_leave_valid_json(self, tmp_path):
+        import concurrent.futures
+        import json
+
+        import Spotify_Downloader as module
+
+        config_path = tmp_path / "config.json"
+
+        def save(index):
+            module.save_config({"version": 1, "writer": index})
+
+        with (
+            patch.object(module, "_config_path", return_value=str(config_path)),
+            concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor,
+        ):
+            list(executor.map(save, range(40)))
+
+        data = json.loads(config_path.read_text(encoding="utf-8"))
+        assert data["writer"] in range(40)
+        assert list(tmp_path.glob(".config-*.tmp")) == []
+
+
 class TestDownloadReportingAccuracy:
     """A run that saved nothing must not look like a run that worked (#100).
 
@@ -5488,39 +5643,3 @@ class TestFfmpegPreflight:
             monkeypatch.setattr(sys, "platform", platform)
             with pytest.raises(RuntimeError, match=needle):
                 MusicScraper().download_track_audio("ytsearch1:x", "/tmp/none.mp3")
-
-
-class TestAtomicConfigPersistence:
-    def test_failed_replace_preserves_previous_config_and_cleans_temp(self, tmp_path):
-        import Spotify_Downloader as module
-
-        config_path = tmp_path / "config.json"
-        with patch.object(module, "_config_path", return_value=str(config_path)):
-            module.save_config({"format": "mp3"})
-            before = config_path.read_bytes()
-            with patch.object(module.os, "replace", side_effect=OSError("disk full")):
-                module.save_config({"format": "flac"})
-
-        assert config_path.read_bytes() == before
-        assert list(tmp_path.glob(".config-*.tmp")) == []
-
-    def test_parallel_saves_always_leave_valid_json(self, tmp_path):
-        import concurrent.futures
-        import json
-
-        import Spotify_Downloader as module
-
-        config_path = tmp_path / "config.json"
-
-        def save(index):
-            module.save_config({"version": 1, "writer": index})
-
-        with (
-            patch.object(module, "_config_path", return_value=str(config_path)),
-            concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor,
-        ):
-            list(executor.map(save, range(40)))
-
-        data = json.loads(config_path.read_text(encoding="utf-8"))
-        assert data["writer"] in range(40)
-        assert list(tmp_path.glob(".config-*.tmp")) == []
