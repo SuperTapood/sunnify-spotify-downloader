@@ -138,6 +138,29 @@ class TrackInfo:
         """Alias for id field for compatibility."""
         return self.id
 
+    @property
+    def isrc(self) -> str | None:
+        """Recording code when supplied by embed, Web API, or catalog metadata."""
+        # Keep metadata fetching independent of the audio search dependencies.
+        values = [self.raw.get("isrc")]
+        external_ids = self.raw.get("external_ids")
+        if isinstance(external_ids, dict):
+            values.append(external_ids.get("isrc"))
+        external_ids = self.raw.get("external_id")
+        if isinstance(external_ids, list):
+            values.extend(
+                item.get("id")
+                for item in external_ids
+                if isinstance(item, dict) and str(item.get("type", "")).lower() == "isrc"
+            )
+        for value in values:
+            if not isinstance(value, str):
+                continue
+            normalized = value.strip().upper().replace("-", "")
+            if re.fullmatch(r"[A-Z]{2}[A-Z0-9]{3}\d{7}", normalized):
+                return normalized
+        return None
+
 
 class SpotifyEmbedAPI:
     """Fetch playlist data from Spotify's embed page.

@@ -13,6 +13,14 @@ import pytest
 import requests
 
 
+@pytest.fixture(autouse=True)
+def offline_music_discovery(monkeypatch):
+    """Legacy yt-dlp tests supply their own results and never contact Music."""
+    client = MagicMock()
+    client.search.return_value = []
+    monkeypatch.setattr("audio_sources.YTMusic", lambda **_kwargs: client)
+
+
 class TestGetFfmpegPath:
     """Tests for get_ffmpeg_path function."""
 

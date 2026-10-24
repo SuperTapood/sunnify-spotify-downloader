@@ -61,6 +61,7 @@ instead of launching the app.
 ```
 sunnify download <url> [<url> ...] [--out DIR] [--format mp3|m4a|opus|flac|wav]
                        [--quality 128|192|256|320] [--sample-rate auto|44100|48000]
+                       [--audio-source auto|youtube-music|youtube]
                        [--workers 1|2|4|6|8]
                        [--track-numbers | --no-track-numbers]
                        [--artist-first | --no-artist-first]
@@ -72,6 +73,11 @@ sunnify download <url> [<url> ...] [--out DIR] [--format mp3|m4a|opus|flac|wav]
 
 - Defaults come from your saved settings; flags override per run. `--help`
   always shows the current effective defaults.
+- `--audio-source auto` (default) searches YouTube Music by ISRC when available,
+  then by title and artist in songs and videos, followed by the existing YouTube
+  search. `youtube-music` and `youtube` restrict discovery to that source. Save a
+  default with `sunnify config --set audio_source=youtube`. Both sources use the
+  same download, cookie, format, and metadata settings.
 - Tracks already on disk are skipped, so re-running a playlist **resumes** it.
 - Four downloads run in parallel by default. Use `--workers 6` or `--workers 8`
   on a fast connection; lower the setting if requests are rate-limited. Save a
@@ -108,6 +114,28 @@ avoiding repeated searches and downloads while preserving separate files and tag
 If one URL fails, later URLs are still processed and the command exits with code 1.
 Ctrl+C stops the remaining queue. Single-URL behavior is unchanged.
 
+### Audio discovery
+
+The discovery order follows [spotDL's audio providers](https://github.com/spotDL/spotify-downloader/tree/master/spotdl/providers/audio),
+implemented for Sunnify without requiring spotDL or Spotify API credentials.
+YouTube Music results must match the title, a credited artist, the requested
+version, and (when known) Spotify's duration within seven seconds. Matching
+albums rank ahead of reissues. An ISRC search still passes these checks; it does
+not automatically authorize the first result. Codes are used only when present
+in Spotify metadata, so missing codes do not require extra requests.
+
+If a matched recording cannot be downloaded, Sunnify tries up to three distinct
+recordings per source. Automatic mode then falls back to the existing YouTube
+search, including Topic, album, and localized-title recovery. Shared video IDs
+are attempted once across both sources, with the existing player-client and
+cookie retries for each video. `--loose-match` applies to the YouTube fallback.
+Discovery requests have a ten-second timeout and retry a failed request once.
+
+For m4a and opus, the downloader prefers AAC and Opus source audio respectively,
+with a best-audio fallback. Output bitrate controls encoding quality; it cannot
+increase the quality of the source recording. SoundCloud, Bandcamp, and Piped
+providers are not included in this integration.
+
 ### Exit codes
 
 | Code | Meaning |
@@ -123,7 +151,7 @@ Ctrl+C stops the remaining queue. Single-URL behavior is unchanged.
 `run_summary`:
 
 ```json
-{"event": "run_started", "url": "...", "type": "playlist", "folder": "...", "format": "mp3", "quality": "320", "sample_rate": "auto", "artist_first": false, "title_only": false, "track_numbers": true, "loose_match": false, "cookies": false}
+{"event": "run_started", "url": "...", "type": "playlist", "folder": "...", "format": "mp3", "audio_source": "auto", "quality": "320", "sample_rate": "auto", "artist_first": false, "title_only": false, "track_numbers": true, "loose_match": false, "cookies": false}
 {"event": "track_done", "title": "...", "artists": "...", "file": "/path/file.mp3", "bytes": 4823041}
 {"event": "track_skipped", "title": "...", "file": "/path/file.mp3"}
 {"event": "warning", "message": "..."}

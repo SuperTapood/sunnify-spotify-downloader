@@ -506,6 +506,7 @@ def cmd_download(args) -> int:
             type=app.detect_spotify_url_type(urls[0])[0] if len(urls) == 1 else "batch",
             folder=out_dir,
             format=scraper.audio_format,
+            audio_source=scraper.audio_source,
             quality=scraper.audio_quality,
             sample_rate=scraper.sample_rate,
             artist_first=scraper.artist_first,

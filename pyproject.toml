@@ -18,6 +18,7 @@ dependencies = [
     "requests>=2.32.2",
     "yt-dlp>=2024.8.6",
     "yt-dlp-ejs>=0.8.0",
+    "ytmusicapi>=1.12.1,<2",
 ]
 
 # `pipx install git+https://github.com/sunnypatell/sunnify-spotify-downloader`
@@ -26,7 +27,7 @@ dependencies = [
 sunnify = "sunnify_cli:main"
 
 [tool.setuptools]
-py-modules = ["Spotify_Downloader", "spotifydown_api", "sunnify_cli", "Template"]
+py-modules = ["Spotify_Downloader", "spotifydown_api", "audio_sources", "sunnify_cli", "Template"]
 
 [project.urls]
 homepage = "https://github.com/sunnypatell/sunnify-spotify-downloader"

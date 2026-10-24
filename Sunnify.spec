@@ -15,6 +15,7 @@ Output:
 
 import sys
 import platform
+from PyInstaller.utils.hooks import collect_data_files
 
 block_cipher = None
 
@@ -77,7 +78,7 @@ a = Analysis(
     datas=[
         ('spotifydown_api.py', '.'),
         ('Template.py', '.'),
-    ] + ffmpeg_datas,
+    ] + ffmpeg_datas + collect_data_files('ytmusicapi'),
     hiddenimports=[
         'sunnify_cli',
         'PyQt6',
@@ -88,6 +89,7 @@ a = Analysis(
         'mutagen.id3',
         'mutagen.easyid3',
         'yt_dlp',
+        'ytmusicapi',
         'requests',
     ],
     hookspath=[],
