@@ -132,6 +132,9 @@ class TrackInfo:
     # care about playlist-position numbering should use this when present and
     # fall back to their own enumerate index otherwise (closes #51).
     position: int | None = None
+    # Full, unencrypted episode audio when Spotify exposes it. Preview clips
+    # stay in preview_url and must never be used as the download source.
+    audio_url: str | None = None
 
     @property
     def spotify_id(self) -> str:
@@ -179,6 +182,7 @@ class SpotifyEmbedAPI:
     _EMBED_PLAYLIST_URL = "https://open.spotify.com/embed/playlist/{playlist_id}"
     _EMBED_ALBUM_URL = "https://open.spotify.com/embed/album/{playlist_id}"
     _EMBED_TRACK_URL = "https://open.spotify.com/embed/track/{track_id}"
+    _EMBED_EPISODE_URL = "https://open.spotify.com/embed/episode/{track_id}"
     _EMBED_ARTIST_URL = "https://open.spotify.com/embed/artist/{artist_id}"
     _CATALOG_URL = "https://spclient.wg.spotify.com/metadata/4/{kind}/{gid}"
     _TRACK_PAGE_URL = "https://open.spotify.com/track/{track_id}"
@@ -430,7 +434,11 @@ class SpotifyEmbedAPI:
         if isinstance(container, dict) and "trackList" in container:
             return container
         container = self._deep_find(data, "type")
-        if isinstance(container, dict) and container.get("type") in ("playlist", "track"):
+        if isinstance(container, dict) and container.get("type") in (
+            "playlist",
+            "track",
+            "episode",
+        ):
             return container
 
         page_props = self._resolve_path(data, ("props", "pageProps")) or {}
@@ -987,9 +995,40 @@ class SpotifyEmbedAPI:
             self._album_cache[track_id] = album
         return album
 
-    def _fetch_track_metadata(self, track_id: str) -> TrackInfo | None:
-        """Fetch metadata for a single track from its embed page."""
-        url = self._EMBED_TRACK_URL.format(track_id=track_id)
+    @classmethod
+    def _episode_audio_url(cls, data: dict) -> str | None:
+        """Use only full MP3 episode sources, never previews or encrypted audio."""
+        container = cls._deep_find(data, "defaultAudioFileObject") or {}
+        audio = container.get("defaultAudioFileObject")
+        if not isinstance(audio, dict) or not re.fullmatch(
+            r"MP3_(?:96|128|160|256|320)", str(audio.get("format", ""))
+        ):
+            return None
+        urls = audio.get("url") or []
+        if isinstance(urls, str):
+            urls = [urls]
+        if not isinstance(urls, list):
+            urls = []
+        preview_container = cls._deep_find(data, "audioPreview") or {}
+        preview = preview_container.get("audioPreview")
+        preview_url = preview.get("url") if isinstance(preview, dict) else None
+        for url in [audio.get("passthroughUrl"), *urls]:
+            if not isinstance(url, str) or not url.startswith(("https://", "http://")):
+                continue
+            if "/mp3-preview/" in url or (
+                isinstance(preview_url, str)
+                and url.split("?", 1)[0] == preview_url.split("?", 1)[0]
+            ):
+                continue
+            return url
+        return None
+
+    def _fetch_track_metadata(
+        self, track_id: str, *, content_type: str = "track"
+    ) -> TrackInfo | None:
+        """Fetch metadata for a single track or episode from its embed page."""
+        template = self._EMBED_EPISODE_URL if content_type == "episode" else self._EMBED_TRACK_URL
+        url = template.format(track_id=track_id)
 
         try:
             data = self._fetch_embed_data(url)
@@ -1007,6 +1046,10 @@ class SpotifyEmbedAPI:
             artists = ", ".join(a.get("name", "") for a in artists_data if isinstance(a, dict))
         else:
             artists = entity.get("subtitle", "")
+        if content_type == "episode":
+            # An episode's subtitle names its show, not a recording artist.
+            artists = str(entity.get("subtitle") or "").strip()
+            title = str(title).strip()
 
         preview_url = None
         audio_preview = entity.get("audioPreview", {})
@@ -1037,7 +1080,9 @@ class SpotifyEmbedAPI:
         # (verified empirically across all currently-tested tracks); fall
         # straight to the og:description scrape with no need for the
         # `if entity.get("album")` branch that was sitting here dead.
-        album = self._fetch_track_album_from_page(track_id)
+        album = (
+            artists if content_type == "episode" else self._fetch_track_album_from_page(track_id)
+        )
 
         return TrackInfo(
             id=track_id,
@@ -1049,6 +1094,7 @@ class SpotifyEmbedAPI:
             duration_ms=entity.get("duration"),
             preview_url=preview_url,
             raw=dict(entity),
+            audio_url=self._episode_audio_url(data) if content_type == "episode" else None,
         )
 
     def validate_playlist(self, playlist_id: str) -> bool:
@@ -1082,6 +1128,17 @@ class SpotifyEmbedAPI:
             raise SpotifyDownAPIError(f"Could not fetch track {track_id}")
         self._cache_track(track_info)
         return track_info
+
+    def get_episode(self, episode_id: str) -> TrackInfo:
+        """Get episode metadata and any publicly available full MP3 source.
+
+        Fetch afresh because episode source URLs can expire. Show names map
+        to artist/album tags so episodes use the same file and tagging flow.
+        """
+        episode = self._fetch_track_metadata(episode_id, content_type="episode")
+        if episode is None:
+            raise SpotifyDownAPIError(f"Could not fetch episode {episode_id}")
+        return episode
 
 
 # Legacy class kept for compatibility - redirects to embed API
@@ -1216,6 +1273,10 @@ class PlaylistClient:
         """
         return self._embed_api.get_track(track_id)
 
+    def get_episode(self, episode_id: str) -> TrackInfo:
+        """Get metadata and any public full audio source for a single episode."""
+        return self._embed_api.get_episode(episode_id)
+
 
 # Utility functions shared across desktop app and web backend
 
@@ -1227,7 +1288,7 @@ class PlaylistClient:
 # Any trailing ?si=... query params are tolerated.
 _SPOTIFY_ID_RE = re.compile(
     r"(?:https?://open\.spotify\.com/(?:intl-[a-z]{2,}/)?|spotify:)"
-    r"(?P<type>playlist|track|album|artist)[/:](?P<id>[a-zA-Z0-9]+)"
+    r"(?P<type>playlist|track|album|artist|episode)[/:](?P<id>[a-zA-Z0-9]+)"
 )
 
 
@@ -1271,7 +1332,7 @@ def extract_album_id(url: str) -> str:
 
 
 def detect_spotify_url_type(url: str) -> tuple[str, str]:
-    """Detect a playlist, album, artist, or track and return (type, id).
+    """Detect a playlist, album, artist, track, or episode and return (type, id).
 
     Accepts canonical `https://open.spotify.com/{type}/{id}` URLs, locale
     `/intl-xx/` prefixed URLs, and `spotify:{type}:{id}` URIs. Trailing query
@@ -1281,7 +1342,7 @@ def detect_spotify_url_type(url: str) -> tuple[str, str]:
         return _match_spotify(url)
     except ValueError as exc:
         raise ValueError(
-            "Invalid Spotify URL. Must be a track, playlist, album, or artist URL."
+            "Invalid Spotify URL. Must be a track, episode, playlist, album, or artist URL."
         ) from exc
 
 

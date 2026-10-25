@@ -1833,6 +1833,7 @@ class MusicScraper(QThread):
         expected_artists=None,
         expected_album=None,
         excluded_video_urls=None,
+        is_episode=False,
     ):
         """Return the best YouTube watch URL for a search, or None.
 
@@ -1869,6 +1870,9 @@ class MusicScraper(QThread):
         `expected_title` + `expected_artists` are optional so legacy callers
         that haven't been updated still work via the older trust-the-top-
         hit-unless-duration-is-clearly-off policy.
+
+        Episodes use their title without a recording artist and require a
+        known duration within seven seconds of the Spotify episode.
         """
         select_opts = {
             "quiet": True,
@@ -2021,8 +2025,15 @@ class MusicScraper(QThread):
                             key=lambda entry: abs(entry["duration"] - expected_duration_s),
                         )
                         off = abs(chosen["duration"] - expected_duration_s)
-                        if off > self._DURATION_TOLERANCE_S_WIDE:
+                        tolerance = (
+                            self._DURATION_TOLERANCE_S
+                            if is_episode
+                            else self._DURATION_TOLERANCE_S_WIDE
+                        )
+                        if off > tolerance:
                             return None, "duration", title_ok, off, native_artist_fallback
+                    elif is_episode:
+                        return None, "duration", title_ok, float("inf"), native_artist_fallback
                 return chosen, "ok", title_ok, None, native_artist_fallback
 
             def recover_from_catalog(
@@ -2372,7 +2383,7 @@ class MusicScraper(QThread):
                 log.info(
                     "closest candidate duration off by %.0fs (>%ss), rejecting",
                     duration_off,
-                    self._DURATION_TOLERANCE_S_WIDE,
+                    self._DURATION_TOLERANCE_S if is_episode else self._DURATION_TOLERANCE_S_WIDE,
                 )
                 return None
 
@@ -2416,9 +2427,16 @@ class MusicScraper(QThread):
         return f"https://www.youtube.com/watch?v={chosen['id']}"
 
     def _iter_youtube_music_matches(
-        self, expected_title, expected_artists, expected_duration_s, expected_album, expected_isrc
+        self,
+        expected_title,
+        expected_artists,
+        expected_duration_s,
+        expected_album,
+        expected_isrc,
+        *,
+        is_episode=False,
     ):
-        """Rank catalog candidates while retaining title, artist, and version gates."""
+        """Rank by title, version, and duration; music also requires artist evidence."""
         artist_tokens = [
             self._normalize_title(artist)
             for artist in self._split_artist_names(expected_artists)
@@ -2445,7 +2463,12 @@ class MusicScraper(QThread):
                     if (
                         candidate["id"] in seen
                         or not title_matches
-                        or not self._structured_metadata_artist_matches(candidate, artist_tokens)
+                        or (
+                            not is_episode
+                            and not self._structured_metadata_artist_matches(
+                                candidate, artist_tokens
+                            )
+                        )
                         or self._has_conflicting_version_marker(candidate, expected_title)
                         or self._has_conflicting_version_marker(
                             {"title": expected_title}, candidate["title"]
@@ -2485,10 +2508,12 @@ class MusicScraper(QThread):
         expected_artists=None,
         expected_album=None,
         expected_isrc=None,
+        source_url=None,
+        is_episode=False,
     ):
         if self.is_cancelled():
             raise InterruptedError("download cancelled")
-        if self._youtube_is_blocked():
+        if not source_url and self._youtube_is_blocked():
             raise RuntimeError("YouTube blocked this network with a bot check")
         # Check for FFmpeg first
         ffmpeg_path = get_ffmpeg_path()
@@ -2533,6 +2558,12 @@ class MusicScraper(QThread):
         def stop_if_cancelled(_status):
             if self.is_cancelled():
                 raise InterruptedError("download cancelled")
+            if source_url and _status.get("status") == "downloading":
+                total = _status.get("total_bytes") or _status.get("total_bytes_estimate")
+                if total:
+                    self.dlprogress_signal.emit(
+                        min(100, int((_status.get("downloaded_bytes") or 0) / total * 100))
+                    )
 
         ydl_opts["progress_hooks"] = [stop_if_cancelled]
         ydl_opts["postprocessor_hooks"] = [stop_if_cancelled]
@@ -2543,6 +2574,17 @@ class MusicScraper(QThread):
             ydl_opts["postprocessor_args"] = {"extractaudio": ["-ar", self.sample_rate]}
 
         expected_path = base + "." + ext
+
+        if source_url:
+            # Public podcast MP3s already identify the exact episode. They
+            # need no music search, browser cookies, or YouTube client retries.
+            with YoutubeDL({**ydl_opts, "ignoreerrors": False}) as ydl:
+                ydl.extract_info(source_url, download=True)
+            if self.is_cancelled():
+                raise InterruptedError("download cancelled")
+            if os.path.exists(expected_path):
+                return expected_path
+            raise RuntimeError("Episode audio download produced no file")
 
         # Widened query then a simplified fallback; success = an audio file
         # actually on disk, so an empty search fails loudly.
@@ -2563,13 +2605,18 @@ class MusicScraper(QThread):
         attempted_video_urls = set()
 
         def candidate_urls():
-            if self.audio_source != "youtube" and expected_title and expected_artists:
+            if (
+                self.audio_source != "youtube"
+                and expected_title
+                and (expected_artists or is_episode)
+            ):
                 matches = self._iter_youtube_music_matches(
                     expected_title,
                     expected_artists,
                     expected_duration_s,
                     expected_album,
                     expected_isrc,
+                    **({"is_episode": True} if is_episode else {}),
                 )
                 with contextlib.closing(matches):
                     yield from matches
@@ -2591,6 +2638,7 @@ class MusicScraper(QThread):
                         expected_artists=expected_artists,
                         expected_album=expected_album,
                         excluded_video_urls=attempted_video_urls,
+                        **({"is_episode": True} if is_episode else {}),
                     )
                     if not video_url or video_url in attempted_video_urls:
                         break
@@ -3135,14 +3183,14 @@ class MusicScraper(QThread):
         return extract_playlist_id(link)
 
     def scrape_track(self, spotify_track_link, music_folder):
-        """Download a single track from Spotify."""
+        """Download a single Spotify track or episode."""
         self._reset_download_state()
         if self.is_cancelled():
             self.PlaylistCompleted.emit("Download cancelled")
             return
         url_type, track_id = detect_spotify_url_type(spotify_track_link)
-        if url_type != "track":
-            raise ValueError("Expected a track URL")
+        if url_type not in ("track", "episode"):
+            raise ValueError("Expected a track or episode URL")
         self._set_total_tracks(1)
 
         try:
@@ -3150,7 +3198,11 @@ class MusicScraper(QThread):
         except SpotifyDownAPIError as exc:
             raise RuntimeError(str(exc)) from exc
 
-        track = spotify_api.get_track(track_id)
+        track = (
+            spotify_api.get_episode(track_id)
+            if url_type == "episode"
+            else spotify_api.get_track(track_id)
+        )
         log.info(
             "single-track scrape: %r by %r id=%s fmt=%s/%s",
             track.title,
@@ -3159,7 +3211,9 @@ class MusicScraper(QThread):
             self.audio_format,
             self.audio_quality,
         )
-        self.song_Album.emit("Single Track Download")
+        self.song_Album.emit(
+            "Episode Download" if url_type == "episode" else "Single Track Download"
+        )
 
         if not os.path.exists(music_folder):
             os.makedirs(music_folder)
@@ -3193,11 +3247,16 @@ class MusicScraper(QThread):
             self._write_metadata_if_enabled(song_meta)
             self.add_song_meta.emit(song_meta)
             self.increment_counter("skipped")
-            self.PlaylistCompleted.emit("Track already exists!")
+            self.PlaylistCompleted.emit(
+                "Episode already exists!" if url_type == "episode" else "Track already exists!"
+            )
             return
 
-        # Download via YouTube search
-        search_query = f"ytsearch1:{track_title} {artists} audio"
+        # Prefer full public episode audio, otherwise use music discovery.
+        # The show supplies the file tags, but it is not the cover artist or
+        # necessarily the uploader's channel. Including it hides valid results.
+        search_artists = "" if url_type == "episode" else artists
+        search_query = f"ytsearch1:{track_title} {search_artists} audio"
         expected_dur = (track.duration_ms / 1000) if track.duration_ms else None
         try:
             final_path = (
@@ -3208,8 +3267,13 @@ class MusicScraper(QThread):
                     filepath,
                     expected_duration_s=expected_dur,
                     expected_title=track_title,
-                    expected_artists=artists,
-                    expected_album=album_name,
+                    expected_artists=search_artists,
+                    expected_album="" if url_type == "episode" else album_name,
+                    **(
+                        {"source_url": track.audio_url, "is_episode": True}
+                        if url_type == "episode"
+                        else {}
+                    ),
                 )
             )
         except Exception as error_status:
@@ -3289,7 +3353,7 @@ class ScraperThread(QThread):
                 self.progress_update.emit(f"URL {index}/{len(urls)}: {url}")
                 try:
                     url_type, _ = detect_spotify_url_type(url)
-                    if url_type == "track":
+                    if url_type in ("track", "episode"):
                         self.scraper.scrape_track(url, self.music_folder)
                     else:
                         self.scraper.scrape_playlist(url, self.music_folder)
@@ -4359,7 +4423,7 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         text, accepted = QInputDialog.getMultiLineText(
             self,
             "Multiple Spotify URLs",
-            "One URL per line (artists, albums, playlists, or tracks):",
+            "One URL per line (artists, albums, playlists, tracks, or episodes):",
             current,
         )
         if accepted:

@@ -27,7 +27,7 @@ Free, open source, cross-platform. Point-and-click desktop app with a built-in h
 
 ## What is Sunnify?
 
-**Sunnify is a free, open-source Spotify playlist downloader for macOS, Windows, and Linux.** Paste any Spotify playlist, album, artist, or track link and Sunnify saves it as local audio files (MP3, M4A, FLAC, Opus, or WAV) with the cover art, title, artist, album, year, and track number written straight into the file's tags. No Spotify account, no API keys, no separate FFmpeg install, and nothing that requires a terminal unless you want one.
+**Sunnify is a free, open-source Spotify playlist downloader for macOS, Windows, and Linux.** Paste a Spotify playlist, album, artist, track, or episode link and Sunnify saves available audio as local files (MP3, M4A, FLAC, Opus, or WAV) with the cover art, title, artist, album, year, and track number written straight into the file's tags. No Spotify account, no API keys, no separate FFmpeg install, and nothing that requires a terminal unless you want one.
 
 It is a desktop GUI built with Python and PyQt6, and every binary doubles as a headless [CLI](docs/CLI.md) for scripts, servers, and AI agents. Metadata is read from Spotify's public pages and audio is sourced and transcoded locally, so everything runs on your own machine.
 
@@ -69,7 +69,7 @@ If `brew upgrade` ever stops finding new versions, remove and re-add it: `brew u
 Every Sunnify binary doubles as a headless CLI: same engine, same settings, no window.
 
 ```bash
-sunnify download "https://open.spotify.com/playlist/..."   # or album/artist/track
+sunnify download "https://open.spotify.com/playlist/..."   # or album/artist/track/episode
 sunnify info "<url>" --json                                # metadata only
 sunnify doctor                                             # self-check
 ```
@@ -106,11 +106,12 @@ Or use Gatekeeper's flow: double-click once, then **System Settings → Privacy 
 ## Features
 
 - **Playlists, albums, artists, and single tracks.** Paste a normal link, an `intl-xx` locale link, or a `spotify:` URI copied from the desktop app. Artist links download their full discography: albums, singles/EPs, and compilations, excluding guest appearances on other artists' releases. Duplicate Spotify track IDs are downloaded once. Each collection downloads into its own folder.
+- **Spotify episodes.** Episode URLs and `spotify:episode:` URIs work in the desktop app, CLI, and web preview. The episode title, show, artwork, date, and duration are preserved. Downloads use public full MP3 sources when available, otherwise the existing YouTube Music/YouTube matching. Spotify-only encrypted audio requires a matching external source; preview clips are never saved as full episodes.
 - **Five audio formats.** MP3, M4A, Opus (lossy at 128 / 192 / 256 / 320 kbps) and FLAC / WAV (lossless). Your choice is remembered between sessions.
 - **Real metadata, written correctly.** Title, artist(s), album, year, and track number are embedded for every format, with the front cover art baked in. MP3 tags are written for maximum player compatibility, so artwork and tags show up everywhere, including older car head-units, stock Android, and Windows Media Player.
 - **Per-track cover art.** Each song gets its own artwork, not one shared playlist cover.
 - **Parallel downloads.** Metadata fetching overlaps audio downloads, with bounded queues and cached metadata. Settings → **Parallel downloads** lets you choose 1, 2, 4 (default), 6, or 8 workers; the CLI accepts `--workers`. Try 6 or 8 on a fast connection, or reduce concurrency if the service rate-limits requests. Stop cancels queued work and interrupts active downloads cooperatively.
-- **Multiple URLs in one queue.** Click **Multiple URLs…** in the desktop app to paste one link per line, or separate links with spaces or commas in the URL field. Mix artists, albums, playlists, and tracks. Duplicate links are ignored, failed URLs are reported, and Stop cancels the remaining queue. The CLI and web preview also accept multiple URLs.
+- **Multiple URLs in one queue.** Click **Multiple URLs…** in the desktop app to paste one link per line, or separate links with spaces or commas in the URL field. Mix artists, albums, playlists, tracks, and episodes. Duplicate links are ignored, failed URLs are reported, and Stop cancels the remaining queue. The CLI and web preview also accept multiple URLs.
 - **Queue progress and preview.** Saved, skipped, and failed counts cover the entire queue; the track counter and progress bars show the current URL. The preview follows the latest track to start and ignores late artwork from older tracks. Overlapping URLs reuse previously downloaded audio within the queue, keeping independent files and tags in each collection's folder.
 - **Open logs in one click.** The main window's **Open logs** button opens the current session log in Notepad on Windows (the default text app on other platforms).
 - **Resume large playlists.** A per-folder manifest records what already landed, so a playlist throttled by rate limits finishes across multiple sessions instead of starting over.
@@ -130,7 +131,7 @@ Or use Gatekeeper's flow: double-click once, then **System Settings → Privacy 
 
 ## How to use
 
-1. **Copy a Spotify link** for a playlist, album, artist, or track (the Share menu, or copy the URL from your browser).
+1. **Copy a Spotify link** for a playlist, album, artist, track, or episode (the Share menu, or copy the URL from your browser).
 2. **Paste it** into Sunnify.
 3. **Pick a format and quality** in Settings, and choose where files should go (defaults to your Music folder).
 4. **Download.** Watch per-track progress; press Stop anytime.

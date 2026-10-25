@@ -414,7 +414,7 @@ def cmd_download(args) -> int:
         emitter.error(
             str(exc),
             code="invalid_url",
-            hint="expected https://open.spotify.com/{playlist,album,artist,track}/... or a spotify: uri",
+            hint="expected https://open.spotify.com/{playlist,album,artist,track,episode}/... or a spotify: uri",
         )
         return EXIT_FATAL
     try:
@@ -530,7 +530,7 @@ def cmd_download(args) -> int:
             # before the scraper has started a track or collection.
             scraper._failed_tracks.clear()
             try:
-                if url_type == "track":
+                if url_type in ("track", "episode"):
                     scraper.scrape_track(url, out_dir)
                 else:
                     scraper.scrape_playlist(url, out_dir)
@@ -574,14 +574,18 @@ def cmd_download(args) -> int:
 
 def _fetch_info(url: str) -> dict[str, Any]:
     url_type, item_id = app.detect_spotify_url_type(url)
-    if url_type == "track":
+    if url_type in ("track", "episode"):
         track_client = SpotifyEmbedAPI()
         try:
-            track = track_client.get_track(item_id)
+            track = (
+                track_client.get_episode(item_id)
+                if url_type == "episode"
+                else track_client.get_track(item_id)
+            )
         finally:
             track_client.close()
         payload = {
-            "type": "track",
+            "type": url_type,
             "id": track.spotify_id,
             "title": track.title,
             "artists": track.artists,
@@ -824,7 +828,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="sunnify",
         description=(
-            "Sunnify headless CLI: download Spotify playlists, albums, artist discographies, and tracks "
+            "Sunnify headless CLI: download Spotify playlists, albums, artist discographies, tracks, and episodes "
             "as tagged local audio files. Same engine and settings as the desktop app."
         ),
         epilog=(
@@ -845,9 +849,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     dl = sub.add_parser(
         "download",
-        help="download a playlist, album, artist discography, or track",
+        help="download a playlist, album, artist discography, track, or episode",
         description=(
-            "Download a Spotify playlist, album, full artist discography, or single track. "
+            "Download a Spotify playlist, album, full artist discography, single track, or episode. "
             "Tracks already in the folder are skipped, so re-running resumes automatically."
         ),
     )
@@ -855,7 +859,7 @@ def build_parser() -> argparse.ArgumentParser:
         "url",
         nargs="+",
         metavar="URL",
-        help="one or more Spotify playlist/album/artist/track URLs (or spotify: URIs)",
+        help="one or more Spotify playlist/album/artist/track/episode URLs (or spotify: URIs)",
     )
     dl.add_argument(
         "--out",
@@ -900,7 +904,7 @@ def build_parser() -> argparse.ArgumentParser:
     info = sub.add_parser(
         "info",
         help="fetch metadata without downloading",
-        description="Print playlist/album/artist/track metadata. No downloads, no ffmpeg needed.",
+        description="Print playlist/album/artist/track/episode metadata. No downloads, no ffmpeg needed.",
     )
     info.add_argument("url", nargs="+", metavar="URL", help="one or more Spotify URLs")
     info.add_argument("--json", action="store_true", help="emit one JSON document")

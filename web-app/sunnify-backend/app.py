@@ -52,10 +52,10 @@ def _fetch_collection(client: PlaylistClient, spotify_url: str) -> tuple[str, li
     url_type, item_id = detect_spotify_url_type(spotify_url)
     tracks: list[dict] = []
 
-    if url_type == "track":
+    if url_type in ("track", "episode"):
         # Reuse the process-wide client and its pooled HTTP session instead
         # of allocating an unclosed Session for every single-track request.
-        track = client.get_track(item_id)
+        track = client.get_episode(item_id) if url_type == "episode" else client.get_track(item_id)
         tracks.append(
             {
                 "id": track.spotify_id,
@@ -99,7 +99,7 @@ def _fetch_collection(client: PlaylistClient, spotify_url: str) -> tuple[str, li
 
 @app.route("/api/scrape-playlist", methods=["POST"])
 def scrape_playlist():
-    """Fetch Spotify playlist/album/artist/track metadata (no downloads).
+    """Fetch Spotify playlist/album/artist/track/episode metadata (no downloads).
 
     This endpoint is optimized for free-tier hosting:
     - No file downloads (saves CPU/memory/disk)
@@ -195,7 +195,7 @@ def index():
             "mode": "metadata-only",
             "description": "Fetches Spotify metadata. For MP3 downloads, use the desktop app.",
             "endpoints": {
-                "POST /api/scrape-playlist": "Fetch playlist/album/artist/track metadata",
+                "POST /api/scrape-playlist": "Fetch playlist/album/artist/track/episode metadata",
                 "GET /api/health": "Health check",
             },
         }

@@ -61,7 +61,7 @@ export default function SunnifyApp() {
       .split(/[\s,]+/)
       .filter(Boolean)) {
       const match = url.match(
-        /^(?:https?:\/\/open\.spotify\.com\/(?:intl-[a-z]{2,}\/)?|spotify:)(playlist|album|artist|track)[/:]([a-zA-Z0-9]+)\/?(?:\?[^#\s]*)?(?:#[^\s]*)?$/
+        /^(?:https?:\/\/open\.spotify\.com\/(?:intl-[a-z]{2,}\/)?|spotify:)(playlist|album|artist|track|episode)[/:]([a-zA-Z0-9]+)\/?(?:\?[^#\s]*)?(?:#[^\s]*)?$/
       )
       if (!match) {
         toast.error(`Invalid Spotify URL: ${url}`)
@@ -308,7 +308,7 @@ export default function SunnifyApp() {
                   </div>
                   <p className="text-lg font-medium text-gray-400">No tracks yet</p>
                   <p className="mt-1 text-sm text-gray-600">
-                    Enter a Spotify playlist, album, artist, or track URL above
+                    Enter a Spotify playlist, album, artist, track, or episode URL above
                   </p>
                 </div>
               ) : (

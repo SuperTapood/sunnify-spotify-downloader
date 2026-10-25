@@ -220,9 +220,10 @@ class TestScrapePlaylistEndpoint:
             "4Z8W4fKeB5YxbusRsdQVPb", content_type="artist"
         )
 
+    @pytest.mark.parametrize("url_type", ["track", "episode"])
     @patch("app.get_playlist_client")
-    def test_valid_track_url(self, mock_get_client, client):
-        """Single tracks reuse the shared client instead of opening a new session."""
+    def test_valid_single_item_url(self, mock_get_client, client, url_type):
+        """Single tracks and episodes reuse the shared HTTP client."""
         mock_client = MagicMock()
         mock_get_client.return_value = mock_client
 
@@ -234,11 +235,12 @@ class TestScrapePlaylistEndpoint:
         mock_track.album = "Solo Album"
         mock_track.cover_url = "https://example.com/track-cover.jpg"
         mock_track.release_date = "2024-06-15"
-        mock_client.get_track.return_value = mock_track
+        get_item = getattr(mock_client, f"get_{url_type}")
+        get_item.return_value = mock_track
 
         response = client.post(
             "/api/scrape-playlist",
-            json={"playlistUrl": "https://open.spotify.com/track/xyz789"},
+            json={"playlistUrl": f"https://open.spotify.com/{url_type}/xyz789?si=shared"},
             content_type="application/json",
         )
 
@@ -248,7 +250,7 @@ class TestScrapePlaylistEndpoint:
         assert len(data["data"]["tracks"]) == 1
         assert data["data"]["tracks"][0]["title"] == "Single Track"
         mock_get_client.assert_called_once_with()
-        mock_client.get_track.assert_called_once_with("xyz789")
+        get_item.assert_called_once_with("xyz789")
         mock_client.get_playlist_metadata.assert_not_called()
         mock_client.iter_playlist_tracks.assert_not_called()
 

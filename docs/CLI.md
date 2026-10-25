@@ -46,7 +46,7 @@ so agents can run them too.
 
 | Command | What it does |
 | :--- | :--- |
-| `sunnify download <url>` | Download a playlist, album, full artist discography, or track |
+| `sunnify download <url>` | Download a playlist, album, full artist discography, track, or episode |
 | `sunnify info <url>` | Fetch metadata only (no downloads, no FFmpeg needed) |
 | `sunnify status [folder]` | Audio files present, manifest state, active download pid |
 | `sunnify config [--set k=v]` | Show or persist settings (the same `config.json` the GUI uses) |
@@ -99,6 +99,19 @@ sunnify download "https://open.spotify.com/artist/4Z8W4fKeB5YxbusRsdQVPb"
 sunnify info "spotify:artist:4Z8W4fKeB5YxbusRsdQVPb" --json
 ```
 
+Episode URLs, locale-prefixed episode links, and `spotify:episode:` URIs are also
+supported. The show name supplies the artist and album tags. Public full MP3
+sources are downloaded directly with your format and quality settings; otherwise
+Sunnify searches the configured YouTube Music/YouTube source by episode title,
+requiring a duration within seven seconds. The show name stays in the saved tags.
+Spotify-only encrypted episodes need a matching external source. A preview clip
+is never used as the full download.
+
+```bash
+sunnify download "https://open.spotify.com/episode/26KO3JVD9z5auNXdlGu27l?si=495152236c58458c"
+sunnify info "spotify:episode:26KO3JVD9z5auNXdlGu27l" --json
+```
+
 Pass multiple URLs to process a mixed queue in order with the same settings:
 
 ```bash
@@ -108,7 +121,7 @@ sunnify info "spotify:playlist:..." "spotify:track:..." --json
 
 Quoted lists separated by whitespace or commas also work. All inputs are validated
 before starting, and repeated links to the same Spotify resource are ignored.
-Each collection keeps its own folder; individual tracks go in the output folder.
+Each collection keeps its own folder; individual tracks and episodes go in the output folder.
 Tracks shared by multiple URLs reuse audio downloaded earlier in the same run,
 avoiding repeated searches and downloads while preserving separate files and tags.
 If one URL fails, later URLs are still processed and the command exits with code 1.
