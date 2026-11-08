@@ -24,7 +24,6 @@ import signal
 import sys
 import threading
 import time
-import uuid
 from typing import Any
 
 import Spotify_Downloader as app
@@ -35,9 +34,7 @@ EXIT_PARTIAL = 1
 EXIT_USAGE = 2  # argparse's own code for bad usage
 EXIT_FATAL = 3
 
-_LOCK_NAME = ".sunnify-cli.lock"
 _COOKIES_DOC = "https://github.com/sunnypatell/sunnify-spotify-downloader/blob/main/docs/CLI.md#youtube-cookies"
-_LOCK_BYTE_OFFSET = 255  # keep owner metadata readable while Windows locks byte 255
 
 
 def _ensure_windows_console() -> None:
@@ -136,187 +133,6 @@ def _resolve_out_dir(out_arg: str | None, cfg: dict) -> str:
         or os.path.join(os.path.expanduser("~"), "Music", "Sunnify")
     )
     return os.path.abspath(os.path.expanduser(out))
-
-
-def _pid_alive(pid: int) -> bool:
-    if pid <= 0:
-        return False
-    if sys.platform == "win32":
-        import ctypes
-
-        handle = ctypes.windll.kernel32.OpenProcess(0x1000, False, pid)  # QUERY_LIMITED
-        if handle:
-            ctypes.windll.kernel32.CloseHandle(handle)
-            return True
-        return False
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    return True
-
-
-def _read_lock_pid(folder: str) -> int | None:
-    with contextlib.suppress(OSError, ValueError):
-        fd = os.open(os.path.join(folder, _LOCK_NAME), os.O_RDONLY)
-        try:
-            # v2.4.1 and older wrote just the pid. New locks append a unique
-            # ownership token; read only the metadata region because Windows
-            # deliberately locks the byte immediately after it.
-            raw = os.read(fd, _LOCK_BYTE_OFFSET)
-        finally:
-            os.close(fd)
-        contents = raw.split(b"\0", 1)[0].decode("utf-8", "replace").strip()
-        pid = int(contents.partition(":")[0])
-        if _pid_alive(pid):
-            return pid
-    return None
-
-
-class _FolderLock:
-    """Cross-platform OS lock so two CLI runs cannot write one folder.
-
-    The file itself remains as a status marker, but ownership is the kernel's
-    byte-range/advisory lock held on ``self._fd``. Kernel locks disappear when
-    a process crashes, avoiding every read/delete stale-pid race.
-    """
-
-    def __init__(self, folder: str):
-        self.path = os.path.join(folder, _LOCK_NAME)
-        self.folder = folder
-        self._owner = f"{os.getpid()}:{uuid.uuid4().hex}"
-        self._held = False
-        self._fd: int | None = None
-
-    @staticmethod
-    def _lock_fd(fd: int) -> None:
-        os.lseek(fd, _LOCK_BYTE_OFFSET, os.SEEK_SET)
-        if sys.platform == "win32":
-            import msvcrt
-
-            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
-        else:
-            import fcntl
-
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-
-    @staticmethod
-    def _unlock_fd(fd: int) -> None:
-        os.lseek(fd, _LOCK_BYTE_OFFSET, os.SEEK_SET)
-        if sys.platform == "win32":
-            import msvcrt
-
-            msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
-        else:
-            import fcntl
-
-            fcntl.flock(fd, fcntl.LOCK_UN)
-
-    @staticmethod
-    def _read_fd(fd: int) -> str:
-        os.lseek(fd, 0, os.SEEK_SET)
-        raw = os.read(fd, _LOCK_BYTE_OFFSET)
-        return raw.split(b"\0", 1)[0].decode("utf-8", "replace").strip()
-
-    @staticmethod
-    def _write_fd(fd: int, value: str) -> None:
-        payload = value.encode("utf-8")
-        if len(payload) >= _LOCK_BYTE_OFFSET:
-            raise OSError("folder lock owner metadata is too long")
-        # Zero-fill the metadata region so replacing a longer prior token
-        # cannot leave parseable garbage behind it. Byte 255 stays untouched
-        # and locked for the lifetime of the owner.
-        payload += b"\0" * (_LOCK_BYTE_OFFSET - len(payload))
-        os.lseek(fd, 0, os.SEEK_SET)
-        offset = 0
-        while offset < len(payload):
-            written = os.write(fd, payload[offset:])
-            if written <= 0:
-                raise OSError("short write updating folder lock")
-            offset += written
-        os.ftruncate(fd, _LOCK_BYTE_OFFSET + 1)
-        os.fsync(fd)
-
-    def acquire(self) -> str | None:
-        """Return an error message, or None once the lock is held."""
-        if self._held:
-            return None
-
-        try:
-            fd = os.open(self.path, os.O_RDWR | os.O_CREAT, 0o600)
-        except OSError as exc:
-            return f"cannot create sunnify folder lock: {exc}"
-
-        try:
-            # Windows cannot lock a byte beyond EOF. Seed the dedicated lock
-            # byte before contending; simultaneous zero-byte writes are
-            # harmless because the kernel lock is the ownership primitive.
-            if os.fstat(fd).st_size <= _LOCK_BYTE_OFFSET:
-                os.lseek(fd, _LOCK_BYTE_OFFSET, os.SEEK_SET)
-                os.write(fd, b"\0")
-                os.fsync(fd)
-            self._lock_fd(fd)
-        except OSError:
-            owner = ""
-            with contextlib.suppress(OSError):
-                owner = self._read_fd(fd)
-            owner_pid = None
-            with contextlib.suppress(ValueError):
-                owner_pid = int(owner.partition(":")[0])
-            os.close(fd)
-            if owner_pid is not None:
-                return f"another sunnify download (pid {owner_pid}) is writing to this folder"
-            return "another sunnify download is writing to this folder"
-
-        try:
-            # Respect a live legacy (pre-OS-lock) pidfile after we have won the
-            # new lock, so upgrades do not overlap an older active CLI.
-            previous = self._read_fd(fd)
-            previous_pid = None
-            # Only pre-kernel-lock releases wrote a bare PID. A modern
-            # ``pid:token`` marker without a held OS lock is stale by
-            # definition; trusting its PID would fail after PID reuse.
-            if ":" not in previous:
-                with contextlib.suppress(ValueError):
-                    previous_pid = int(previous)
-            if (
-                previous_pid is not None
-                and previous_pid not in (0, os.getpid())
-                and _pid_alive(previous_pid)
-            ):
-                self._unlock_fd(fd)
-                os.close(fd)
-                return f"another sunnify download (pid {previous_pid}) is writing to this folder"
-            self._write_fd(fd, self._owner + "\n")
-        except OSError as exc:
-            with contextlib.suppress(OSError):
-                self._unlock_fd(fd)
-            os.close(fd)
-            return f"cannot write sunnify folder lock: {exc}"
-
-        self._fd = fd
-        self._held = True
-        return None
-
-    def release(self) -> None:
-        if not self._held:
-            return
-        fd, self._fd = self._fd, None
-        self._held = False
-        if fd is None:
-            return
-        try:
-            # Keep one byte in the persistent marker so the next Windows
-            # process can lock it immediately; pid 0 is never considered live.
-            with contextlib.suppress(OSError):
-                self._write_fd(fd, "0\n")
-        finally:
-            with contextlib.suppress(OSError):
-                self._unlock_fd(fd)
-            with contextlib.suppress(OSError):
-                os.close(fd)
 
 
 class _RunState:
@@ -451,21 +267,12 @@ def cmd_download(args) -> int:
             message,
             code=code,
             hint=(
-                "install deno: https://docs.deno.com/runtime/getting_started/installation/"
+                "install deno (https://docs.deno.com/runtime/getting_started/installation/) "
+                "or node 22+ (https://nodejs.org/)"
                 if code == "deno_missing"
                 else f"export youtube cookies as a netscape cookies.txt ({_COOKIES_DOC}), "
                 "or pass --cookies '' to run without them"
             ),
-        )
-        return EXIT_FATAL
-
-    lock = _FolderLock(out_dir)
-    lock_err = lock.acquire()
-    if lock_err:
-        emitter.error(
-            lock_err,
-            code="folder_locked",
-            hint="wait for the other run to finish, or pass a different --out",
         )
         return EXIT_FATAL
 
@@ -519,31 +326,59 @@ def cmd_download(args) -> int:
         t0 = time.monotonic()
         failed = []
         failed_urls = []
-        for index, url in enumerate(urls, 1):
-            if cancel_event.is_set():
-                break
-            url_type, _ = app.detect_spotify_url_type(url)
-            scraper.begin_url(index)
-            if len(urls) > 1:
-                emitter.event("url_started", url=url, index=index, total=len(urls), type=url_type)
-            # Clear failures before dispatch too: metadata errors can happen
-            # before the scraper has started a track or collection.
-            scraper._failed_tracks.clear()
-            try:
-                if url_type in ("track", "episode"):
-                    scraper.scrape_track(url, out_dir)
-                else:
-                    scraper.scrape_playlist(url, out_dir)
-            except Exception as exc:
+        code = None
+        try:
+            for index, url in enumerate(urls, 1):
                 if cancel_event.is_set():
                     break
-                if len(urls) == 1:
-                    raise
-                failed_urls.append(url)
-                emitter.error(f"{url}: {exc}", code="url_failed")
+                url_type, _ = app.detect_spotify_url_type(url)
+                scraper.begin_url(index)
+                if len(urls) > 1:
+                    emitter.event(
+                        "url_started", url=url, index=index, total=len(urls), type=url_type
+                    )
+                # Metadata errors can happen before a track or collection starts.
+                scraper._failed_tracks.clear()
+                try:
+                    if url_type in ("track", "episode"):
+                        scraper.scrape_track(url, out_dir)
+                    else:
+                        scraper.scrape_playlist(url, out_dir)
+                except app.FolderLockedError as exc:
+                    if len(urls) == 1:
+                        raise
+                    failed_urls.append(url)
+                    emitter.error(
+                        f"{url}: {exc}",
+                        code="folder_locked",
+                        hint="wait for the other run to finish; a different playlist can run alongside it",
+                    )
+                except Exception as exc:
+                    if cancel_event.is_set():
+                        break
+                    if len(urls) == 1:
+                        raise
+                    failed_urls.append(url)
+                    emitter.error(f"{url}: {exc}", code="url_failed")
+                failed.extend(scraper._failed_tracks)
+        except app.FolderLockedError as exc:
+            emitter.error(
+                str(exc),
+                code="folder_locked",
+                hint="wait for the other run to finish; a different playlist can run alongside it",
+            )
             failed.extend(scraper._failed_tracks)
+            code = EXIT_FATAL
+        except Exception as exc:
+            emitter.error(
+                f"download run failed: {exc}", code="run_failed", hint="run `sunnify doctor`"
+            )
+            failed.extend(scraper._failed_tracks)
+            code = EXIT_FATAL
         stopped = cancel_event.is_set()
-        code = EXIT_PARTIAL if (failed or failed_urls or stopped) else EXIT_OK
+        if code is None:
+            code = EXIT_PARTIAL if (failed or failed_urls or stopped) else EXIT_OK
+        # Once run_started is out, run_summary always ends the stream.
         emitter.event(
             "run_summary",
             landed=len(state.landed),
@@ -569,7 +404,6 @@ def cmd_download(args) -> int:
                 signal.signal(signal.SIGINT, previous_sigint)
         if scraper is not None:
             scraper.close()
-        lock.release()
 
 
 def _fetch_info(url: str) -> dict[str, Any]:
@@ -675,7 +509,7 @@ def cmd_status(args) -> int:
             for name in os.listdir(folder)
             if name.lower().endswith(exts) and os.path.isfile(os.path.join(folder, name))
         )
-    active_pid = _read_lock_pid(folder)
+    active_pid = app.read_lock_pid(folder)
     payload = {
         "folder": folder,
         "audio_files": len(audio_files),
@@ -778,11 +612,12 @@ def cmd_doctor(args) -> int:
     cookies = app.load_config().get("cookies_file")
     if cookies:
         problem = app.cookies_problem(os.path.expanduser(cookies))
+        runtime = None if problem else app.find_js_runtime()
         checks.append(
             {
                 "check": "youtube_cookies",
                 "ok": problem is None,
-                "detail": problem[1] if problem else f"on, deno at {app.find_deno()}",
+                "detail": problem[1] if problem else f"on, {runtime[0]} at {runtime[1]}",
             }
         )
     else:

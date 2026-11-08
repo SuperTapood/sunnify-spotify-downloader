@@ -177,6 +177,33 @@ def test_invalid_second_url_does_not_prompt_for_download_folder(window, monkeypa
     assert "Invalid Spotify URL" in window.statusMsg.text()
 
 
+def test_enter_adds_artists_and_episodes_to_the_active_queue(window):
+    window._is_downloading = True
+    window._current_link = TRACK
+    window.scraper_thread = MagicMock()
+    window.PlaylistLink.setText(
+        f"{TRACK}?si=duplicate, spotify:artist:artist spotify:episode:episode"
+    )
+    window.PlaylistLink.returnPressed.emit()
+    expected = ["spotify:artist:artist", "spotify:episode:episode"]
+    assert list(window._queue) == expected
+    window.scraper_thread.enqueue_urls.assert_called_once_with(expected)
+    assert not window._cancel_event.is_set()
+    window._is_downloading = False
+
+
+def test_invalid_link_during_download_preserves_the_queue(window):
+    window._is_downloading = True
+    window._current_link = TRACK
+    window.scraper_thread = MagicMock()
+    window.PlaylistLink.setText(f"{ARTIST}, invalid")
+    window.PlaylistLink.returnPressed.emit()
+    window.scraper_thread.enqueue_urls.assert_not_called()
+    assert not window._queue
+    assert "Invalid Spotify URL" in window.statusMsg.text()
+    window._is_downloading = False
+
+
 @pytest.fixture
 def cli_download(monkeypatch, tmp_path):
     scraper = app.MusicScraper()
@@ -239,6 +266,23 @@ def test_cli_batch_continues_after_exception(cli_download, monkeypatch, capsys):
     assert calls == [ARTIST, TRACK, ALBUM]
     summary = json.loads(capsys.readouterr().out.splitlines()[-1])
     assert summary["failed_urls"] == [ARTIST]
+
+
+def test_cli_batch_continues_after_a_locked_collection(cli_download, monkeypatch, capsys):
+    scraper, calls, _, args = cli_download
+
+    def download(url, _):
+        calls.append(url)
+        if url == ARTIST:
+            raise app.FolderLockedError("another download holds this folder")
+
+    monkeypatch.setattr(scraper, "scrape_playlist", download)
+    assert cli.cmd_download(args) == cli.EXIT_PARTIAL
+    assert calls == [ARTIST, TRACK, ALBUM]
+    events = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert next(event for event in events if event["event"] == "error")["code"] == "folder_locked"
+    assert events[-1]["event"] == "run_summary"
+    assert events[-1]["failed_urls"] == [ARTIST]
 
 
 def test_cli_cancel_stops_queue(cli_download, monkeypatch, capsys):

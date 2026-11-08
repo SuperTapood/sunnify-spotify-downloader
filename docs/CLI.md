@@ -82,7 +82,13 @@ sunnify download <url> [<url> ...] [--out DIR] [--format mp3|m4a|opus|flac|wav]
 - Four downloads run in parallel by default. Use `--workers 6` or `--workers 8`
   on a fast connection; lower the setting if requests are rate-limited. Save a
   default with `sunnify config --set download_workers=6` or in GUI Settings.
-- A per-folder pid lock stops two runs from racing the same destination.
+- Each playlist or album folder is locked while it downloads, across the
+  desktop app and every terminal, so two runs never write the same folder;
+  different playlists can download side by side. A lock left by a crashed run
+  is reclaimed automatically.
+- To queue several links, run them one after another:
+  `for u in "$A" "$B"; do sunnify download "$u"; done` (PowerShell:
+  `foreach ($u in $A, $B) { sunnify download $u }`).
 - First `Ctrl+C` finishes in-flight tracks and exits cleanly; a second one
   force-quits.
 - `--cookies FILE` is only for networks YouTube gates; see
@@ -160,8 +166,10 @@ providers are not included in this integration.
 
 ## Machine-readable output (`--json`)
 
-`download --json` emits NDJSON: one event per line, always ending with
-`run_summary`:
+`download --json` emits NDJSON: one event per line. Once `run_started` is
+out, the stream always ends with `run_summary`, even when the run fails
+(`exit_code` 3); an error before that (bad URL, missing FFmpeg) is a single
+error envelope:
 
 ```json
 {"event": "run_started", "url": "...", "type": "playlist", "folder": "...", "format": "mp3", "audio_source": "auto", "quality": "320", "sample_rate": "auto", "artist_first": false, "title_only": false, "track_numbers": true, "loose_match": false, "cookies": false}
@@ -209,11 +217,14 @@ You need two things:
    shows how to export one. Use a dedicated browser profile or a private
    window, ideally with a secondary account. YouTube can flag an account used
    this way, and the file should be treated like a password.
-2. **[Deno](https://docs.deno.com/runtime/getting_started/installation/)**, a
-   JavaScript runtime. A logged-in session only gets YouTube player variants
-   that require solving a JavaScript challenge, and yt-dlp runs the solver
-   (bundled with Sunnify) in Deno's sandbox. Sunnify finds Deno on your `PATH`
-   or in its default install location.
+2. **A JavaScript runtime:**
+   [Deno](https://docs.deno.com/runtime/getting_started/installation/), or
+   [Node.js](https://nodejs.org/) 22 or later. A logged-in session only gets
+   YouTube player variants that require solving a JavaScript challenge, and
+   yt-dlp runs the solver (bundled with Sunnify) in that runtime's sandbox.
+   Sunnify looks on your `PATH` and in the usual install locations, uses Deno
+   when both are present (yt-dlp's own order), and skips any version yt-dlp
+   doesn't support.
 
 Turn it on for one run with `--cookies ~/youtube-cookies.txt`, or for every run
 (desktop app included) with `sunnify config --set cookies_file=~/youtube-cookies.txt`.
@@ -223,9 +234,10 @@ Turn it on for one run with `--cookies ~/youtube-cookies.txt`, or for every run
 Sunnify only ever reads the file: each request gets a private temporary copy
 of its valid cookies that is deleted afterwards, so your file is never
 modified, and its contents never reach the logs or the terminal. A missing or
-malformed file stops the run with `cookies_unusable`, and a missing Deno with
-`deno_missing`; `sunnify doctor` checks both. If YouTube still refuses the
-network with cookies loaded, they have usually expired; export them again.
+malformed file stops the run with `cookies_unusable`, and no supported runtime
+with `deno_missing`; `sunnify doctor` checks both and names the runtime in use.
+If YouTube still refuses the network with cookies loaded, they have usually
+expired; export them again.
 
 ## For AI agents
 
@@ -236,9 +248,12 @@ This CLI is designed to be driven autonomously (per the
   privileges, and the installers follow the same rule.
 - `--json` output is a stable contract; `run_summary` is the stream
   terminator.
-- Long playlist? Run it in the background; `sunnify status <folder>` reports
-  progress from another shell (files land incrementally, the lock pid tells
-  you it's still running).
+- Long playlist? Run it in the background; `sunnify status <playlist folder>`
+  reports progress from another shell (files land incrementally, the lock pid
+  tells you it's still running).
+- Parallel runs are fine for different playlists. Each one makes its own
+  requests from your IP, which is what YouTube's bot check watches, so a
+  queue (one after another) is the gentler default.
 - Something failing? `sunnify doctor --json` says which dependency or
   upstream is broken, with hints.
 
@@ -249,4 +264,4 @@ This CLI is designed to be driven autonomously (per the
 | Settings | One shared `config.json`: `sunnify config --set` and the GUI's settings panel read and write the same file, so a choice made in either face applies to both. Flags override it per run. |
 | Logs | Same rotating session log as the app. **Open logs** in the main window opens it in Notepad on Windows; Settings also has **Open logs folder**. `sunnify doctor` shows the directory. |
 | Resume manifest | `.sunnify-manifest.jsonl` inside each playlist folder |
-| Run lock | `.sunnify-cli.lock` inside the destination folder |
+| Run lock | `.sunnify.lock` inside each playlist folder while it downloads, shared by the desktop app and the CLI |

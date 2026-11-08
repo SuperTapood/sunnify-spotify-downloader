@@ -39,7 +39,7 @@ jobs:
       matrix:
         # macos-15-intel proves the lock resolves x86_64 macOS wheels too -
         # the Intel release build installs from this same lock.
-        os: [ubuntu-latest, windows-latest, macos-14, macos-15-intel]
+        os: [ubuntu-24.04, windows-latest, macos-15, macos-15-intel]
     steps:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -47,7 +47,7 @@ jobs:
           persist-credentials: false
 
       - name: Set up Python (same version as release builds)
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.13"
 

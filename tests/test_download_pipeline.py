@@ -89,6 +89,39 @@ def test_queue_counts_skips_failures_and_reuses_overlapping_tracks(tmp_path, mon
     scraper.close()
 
 
+def test_links_added_during_download_share_progress_and_audio_cache(tmp_path, monkeypatch):
+    first, second = "spotify:playlist:one", "spotify:playlist:two"
+    worker = app.ScraperThread(first, music_folder=str(tmp_path))
+    scraper = worker.scraper
+    api = MagicMock()
+    api.get_playlist_metadata.side_effect = lambda pid, **_: PlaylistInfo(
+        pid, "Owner", None, None, 1
+    )
+    api.iter_playlist_tracks.side_effect = lambda _pid, **_: iter([track("shared")])
+    monkeypatch.setattr(scraper, "ensure_spotifydown_api", lambda: api)
+    downloads = []
+
+    def download(_query, destination, **_kwargs):
+        downloads.append(destination)
+        assert worker.enqueue_urls([second])
+        Path(destination).write_bytes(b"audio")
+        return destination
+
+    monkeypatch.setattr(scraper, "download_track_audio", download)
+    snapshots, sources, statuses = [], [], []
+    scraper.progress_snapshot.connect(snapshots.append, type=Qt.ConnectionType.DirectConnection)
+    worker.source_started.connect(lambda index, total: sources.append((index, total)))
+    worker.progress_update.connect(statuses.append)
+    worker.run()
+    assert len(downloads) == 1
+    assert sources == [(1, 1), (2, 2)]
+    assert snapshots[-1]["url_count"] == snapshots[-1]["downloaded"] == 2
+    assert snapshots[-1]["reused"] == 1
+    assert statuses[-1] == "Completed 2 URL(s)."
+    assert (tmp_path / "two - Owner" / "shared - Artist.mp3").read_bytes() == b"audio"
+    assert not worker.enqueue_urls([first])
+
+
 def test_parallel_outcome_snapshots_are_atomic():
     scraper = app.MusicScraper()
     snapshots = []
